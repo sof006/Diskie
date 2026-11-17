@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Packaging output
+/dist/
+*.AppImage
+*.msi
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings
+.claude/settings.local.json
