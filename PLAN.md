@@ -178,6 +178,36 @@ Reveal in Explorer, open, copy path, **Delete to Recycle Bin** (default) or perm
 - SMB shares come from existing mounts (`cifs`, or GVFS under `/run/user/<uid>/gvfs`) or through Diskie's built-in SMB client, so no root is needed to mount anything.
 - Optional: a "Rescan as administrator" action that re-runs only the scanner through `pkexec diskie scan --json` and streams the results back, so the UI itself never runs as root. Planned as a later addition, not v1.
 
+### 4.9 Updates from GitHub Releases (`diskie-update`)
+
+Diskie keeps itself current from the project's GitHub Releases, so nobody has to revisit the releases page.
+
+**How a release is published (GitHub Actions, on every version tag):**
+1. CI builds the Windows `.exe` (portable) and `.msi`, plus the Linux `.tar.gz` and `.AppImage`.
+2. It signs every file with a **minisign (Ed25519) key** held only in the repository's Actions secrets, and adds a small `latest.json` manifest to the release. The manifest gives the version, the release-notes summary, and the download URL, SHA-256 and signature for each platform's file. Windows files are also Authenticode-signed once a certificate is in place, so SmartScreen doesn't warn.
+
+**How the app checks:**
+- It fetches `https://github.com/sof006/Diskie/releases/latest/download/latest.json`. That is a plain file download, not the GitHub API, so there is no API rate limit and no token. Pre-releases have their own manifest, for anyone who opts into a "Preview" channel.
+- **When:** at most once a day, in the background a few seconds after launch, and on demand from *Help › Check for updates*. The CLI has `diskie update --check` and `diskie update`.
+- **Privacy:** that request goes only to github.com and sends nothing but a normal HTTP request. There is no telemetry, and the settings page says so.
+
+**How it installs:**
+1. It downloads the file, then **verifies the SHA-256 and the minisign signature against the public key compiled into Diskie** before touching anything. This matters doubly because Diskie runs as administrator on Windows: an unsigned or tampered file is rejected, and HTTPS alone is not trusted to be enough.
+2. **Windows, portable `.exe`:** a running executable can't be overwritten, but it can be renamed. Diskie renames itself to `Diskie.old.exe`, puts the new file in its place (the `self-replace` crate), and offers *Restart now*.
+3. **Windows, MSI install:** it downloads the new `.msi` and hands it to `msiexec`, so Programs and Features stays accurate.
+4. **Linux AppImage:** it replaces the file `$APPIMAGE` points to. The AppImage also carries zsync update information, so tools such as AppImageUpdate work too.
+5. **Linux tar.gz:** it replaces the binary only if the user can write to it. Otherwise it shows where to download.
+6. Builds packaged by a distribution, if any appear, turn self-update off and leave updates to the package manager.
+
+**Safety:** if the new version fails to start cleanly twice, Diskie restores `Diskie.old.exe` (or the previous AppImage) on the next launch and says why. The old copy is deleted after the first successful run of the new one.
+
+**What the user sees:**
+- **A notice, not a dialog:** a quiet line in the status bar, "Diskie 0.4.0 is available · What's new · Update". Nothing pops up over a running scan, and nothing restarts by itself mid-scan.
+- **One setting:** *Install automatically* (applies on the next launch), *Notify only* (the default), or *Off*.
+- **Release notes:** taken from the GitHub release text and shown in-app.
+
+**Crates:** `ureq` (small HTTP client, rustls), `minisign-verify`, `sha2`, `self-replace`, `semver`.
+
 ---
 
 ## 5. Interface
@@ -244,12 +274,12 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0. Spike** (1 week) ✅ | GPUI vs iced prototype; MFT read benchmark using `ntfs-reader` vs a custom parser | Framework chosen (GPUI). Win32 enumeration measured. The MFT run (needs an elevated shell) and on-display frame rates are still open; see [spikes/RESULTS.md](spikes/RESULTS.md) |
-| **1. Core** | `diskie-model`, Win32 fast enumerator, MFT backend, CLI with `scan` and a `top` listing | CLI scans C: and a UNC path; meets the scan targets in §1; fuzz and property tests on the model |
-| **2. App MVP** | Window, sidebar (drives), virtual tree-table, treemap, sync between them, live scan progress, Recycle Bin delete, dark and light themes | Daily-driveable on local disks; frame-time targets met with 10M nodes |
+| **1. Core** | `diskie-model`, Win32 fast enumerator, MFT backend, CLI with `scan` and a `top` listing; release pipeline (GitHub Actions builds, minisign-signed files, `latest.json`, see §4.9) | CLI scans C: and a UNC path; meets the scan targets in §1; fuzz and property tests on the model; a tagged build publishes a signed release |
+| **2. App MVP** | Window, sidebar (drives), virtual tree-table, treemap, sync between them, live scan progress, Recycle Bin delete, dark and light themes, in-app updater (check, verify, replace, roll back) | Daily-driveable on local disks; frame-time targets met with 10M nodes; one build updates itself to the next |
 | **3. Network** | Share discovery, Connect as…, multi-root scans, throttling; benchmark native SMB crates; integrate the better one | Scan a share on a real NAS and on Windows Server; credentials go only to Credential Manager |
 | **4. Analysis** | File types panel, top-N, age histogram, owners, search and filters, duplicates | Each view handles 10M nodes without UI stalls |
 | **5. History and reports** | Snapshots, compare, CSV/JSON/XLSX/HTML export, scheduled scans via CLI | A snapshot round-trip is lossless; the diff view is correct on fixture trees |
-| **6. Polish and ship** | Explorer context-menu entry, USN incremental refresh, settings, portable build + MSI, code signing, auto-update (opt-in) | Signed release, under 20 MB |
+| **6. Polish and ship** | Explorer context-menu entry, USN incremental refresh, settings, portable build + MSI, Authenticode code signing | Signed release, under 20 MB |
 | **7. Linux** | POSIX enumerator, Filelight-style unprivileged scanning, built-in SMB client on Linux, **tar.gz and AppImage** packages built in CI (Ubuntu 22.04 base for broad glibc compatibility), Wayland and X11 tested | AppImage runs on a stock Ubuntu, Fedora and Arch desktop without installing anything |
 
 ### Testing and benchmarks throughout
@@ -271,6 +301,7 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 | Hashing | `xxhash-rust` (xxh3), `blake3` |
 | Snapshots | `rkyv`, `zstd`, `memmap2` |
 | Export | `rust_xlsxwriter`, `csv`, `serde_json`, `krilla` (PDF) |
+| Updates | `ureq` (rustls), `minisign-verify`, `sha2`, `self-replace`, `semver` |
 | Credentials | `keyring` |
 | Recycle Bin | `trash` |
 | Window effects | `window-vibrancy` (if GPUI doesn't expose Mica directly) |
