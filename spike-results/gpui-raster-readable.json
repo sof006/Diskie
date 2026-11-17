@@ -1,0 +1,17 @@
+{
+  "framework": "gpui-raster",
+  "nodes": 2000010,
+  "rows": 2000010,
+  "treemap_rects": 3088,
+  "data_build_ms": 92.8,
+  "startup_to_first_frame_ms": 230.5,
+  "frames": 26,
+  "interval_ms": { "mean": 249.35, "p50": 252.75, "p95": 253.95, "p99": 254.12, "max": 254.12 },
+  "frames_over_16_7ms": 25,
+  "frames_over_33ms": 25,
+  "build_ms": { "mean": 2.68, "p50": 2.49, "p95": 4.30, "p99": 7.35, "max": 7.35 },
+  "process_cpu_percent_of_one_core": 1.5,
+  "process_cpu_ms_per_frame": 3.75,
+  "working_set_mb_end": 113.5,
+  "peak_working_set_mb": 115.2
+}

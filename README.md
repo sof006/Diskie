@@ -2,7 +2,7 @@
 
 A fast disk space analyzer written entirely in Rust, in the same space as TreeSize and WizTree.
 
-> **Status: planning.** There is no code yet. The design and roadmap are in [PLAN.md](PLAN.md).
+> **Status: planning.** The week-1 prototypes are done and GPUI was chosen (see [spikes/RESULTS.md](spikes/RESULTS.md)); the app itself is not started yet. The design and roadmap are in [PLAN.md](PLAN.md).
 
 ## Goals
 

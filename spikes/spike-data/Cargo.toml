@@ -1,0 +1,10 @@
+[package]
+name = "spike-data"
+version = "0.0.0"
+description = "Week-1 spike: synthetic file tree, treemap layout and frame statistics shared by the UI prototypes"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }

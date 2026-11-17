@@ -1,0 +1,17 @@
+{
+  "framework": "gpui-quads",
+  "nodes": 2000010,
+  "rows": 2000010,
+  "treemap_rects": 143819,
+  "data_build_ms": 112.5,
+  "startup_to_first_frame_ms": 246.0,
+  "frames": 41,
+  "interval_ms": { "mean": 251.69, "p50": 252.42, "p95": 253.85, "p99": 254.30, "max": 254.30 },
+  "frames_over_16_7ms": 40,
+  "frames_over_33ms": 40,
+  "build_ms": { "mean": 125.50, "p50": 123.62, "p95": 147.13, "p99": 151.85, "max": 151.85 },
+  "process_cpu_percent_of_one_core": 50.4,
+  "process_cpu_ms_per_frame": 126.95,
+  "working_set_mb_end": 240.7,
+  "peak_working_set_mb": 257.7
+}

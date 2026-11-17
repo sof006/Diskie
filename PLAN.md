@@ -43,7 +43,10 @@ The UI has to do four hard things: a virtualized tree-table with millions of row
 - The risk is API churn. Mitigations:
   1. Pin an exact GPUI and GPUI Kit version (GPUI Kit's own pinning crate does this) and upgrade on purpose, not automatically.
   2. Keep **all** logic in UI-agnostic crates (§4). The UI crate only renders state and sends commands, so moving to iced would mean rewriting one crate, not the app.
-- **Week-1 spike, a go/no-go gate:** build the same throwaway prototype in GPUI and in iced: a 2M-row virtual tree-table plus a 150k-rectangle treemap, resizing and hovering at 120 Hz on a mid-range laptop iGPU. Pick the framework based on measured frame times and how the code feels, not on this table.
+- **Week-1 spike: done, GPUI chosen.** The same prototype (2M-row virtual tree, 144k-rectangle treemap) was built in both frameworks; see [spikes/RESULTS.md](spikes/RESULTS.md).
+  - Both stay far under the frame budget once the treemap is a cached bitmap: GPUI about 2.8 ms of CPU per frame, iced about 1 ms.
+  - GPUI reaches its first frame in about 0.25 s against iced's 1.1–2.8 s, and uses 40 MB of baseline memory against 240 MB.
+  - Frame rates and text quality on a connected display are still to be checked.
 
 **Ruled out:** Tauri, Dioxus-webview and Electron-style stacks (not "completely Rust" in the UI, and heavier). Slint (the attribution license and the missing immediate-mode canvas both hurt the treemap). GTK4-rs (poor Windows experience).
 
@@ -115,7 +118,7 @@ All backends implement one trait, `Scanner::scan(root, opts, sink)`, and are cho
 |---|---|---|
 | **MFT reader** | Local NTFS volume, elevated | Open `\\.\C:`, read `$MFT` in large sequential chunks, parse FILE records in parallel (rayon), rebuild the tree from parent references. Start from `ntfs-reader` / `usn-journal-rs`, or a custom parser if they are too slow or allocate too much. This is where WizTree's speed comes from. |
 | **USN journal refresh** | After an MFT scan | Apply changes from the change journal for near-instant rescans of the same volume. |
-| **Win32 fast enumerator** | Not elevated, ReFS/FAT/exFAT, **and SMB via UNC paths** | `NtQueryDirectoryFile` with `FileIdExtdDirectoryInformation` and 64–256 KB buffers. Size, times and attributes come back with the directory listing, so there are no per-file `stat` calls. A work-stealing pool, with concurrency tuned per volume: low for HDDs, high (32–64) for SMB, where latency rather than throughput is the limit. `\\?\` long-path prefix everywhere. |
+| **Win32 fast enumerator** | Not elevated, ReFS/FAT/exFAT, **and SMB via UNC paths** | `NtQueryDirectoryFile` with `FileIdExtdDirectoryInformation` and 64–256 KB buffers. Size, times and attributes come back with the directory listing, so there are no per-file `stat` calls. A work-stealing pool, with concurrency tuned per volume: high (32–64) for SMB, where latency rather than throughput is the limit, and **1–2 for hard disks**, detected through the device's seek penalty. In the spike, a fully parallel walk of a cold 1.7M-entry hard disk did not finish in 5 minutes; with a warm cache it took 2.3 s. `\\?\` long-path prefix everywhere. |
 | **POSIX enumerator** | Linux (phase 7) | `openat` + `getdents64` + `statx`, the same work-stealing pool. Runs as the normal user, the way Filelight does (see §4.8). |
 | **Native SMB client** | Browsing a share with different credentials *without* mapping a drive; Linux/macOS; servers where Win32 enumeration is slow | Pure-Rust SMB2/3 via the [`smb2`](https://docs.rs/crate/smb2) crate (pipelined I/O, signing and encryption, built for a file-manager use case) or [`smb`](https://docs.rs/crate/smb) (smb-rs: NTLM and Kerberos via `sspi`, QUIC, multichannel). Benchmark both in phase 3. |
 
@@ -223,6 +226,7 @@ The aim is a precise instrument, closer to a good IDE or an audio tool than to a
 - **Color only carries meaning.** A near-neutral UI (warm-grey dark theme and paper-white light theme), with color reserved for the treemap's file-type categories and the size bars. The category palette is generated in **OKLCH** with equal lightness, so no category visually dominates because of its hue, and it is checked for color-blind safety. One accent, **amber** (`#e3a64c` dark / `#9a5d0a` light; decided 2026-11-17), for focus and selection only.
 - **The treemap is the hero**, and it gets real design work:
   - Squarified layout (Bruls, Huizing & van Wijk) computed on a background thread, depth-limited by pixel size (rectangles under ~3 px are merged into their parent).
+  - **Rendered as a cached bitmap** (measured in the spike): the rectangles are rasterized on the CPU (about 5 ms for 144k) and redrawn only when the layout, size or zoom changes. Labels, hover, selection and the zoom animation are drawn live on top. Painting each rectangle every frame cost 124 ms at that scale.
   - **SpaceSniffer-style folder header strips are the default** (decided 2026-11-17), so the hierarchy reads without hovering. Flat nesting and cushion shading are options in settings.
   - Labels only where they fit, truncated in the middle (`very_long…name.mkv`) and showing size.
   - Zoom transitions of 120–160 ms with ease-out that animate rectangles from their old positions to their new ones. That is the one place motion helps you keep your place, so it is the one place it is used.
@@ -239,7 +243,7 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0. Spike** (1 week) | GPUI vs iced prototype; MFT read benchmark using `ntfs-reader` vs a custom parser | Framework chosen; MFT parse of C: measured |
+| **0. Spike** (1 week) ✅ | GPUI vs iced prototype; MFT read benchmark using `ntfs-reader` vs a custom parser | Framework chosen (GPUI). Win32 enumeration measured. The MFT run (needs an elevated shell) and on-display frame rates are still open; see [spikes/RESULTS.md](spikes/RESULTS.md) |
 | **1. Core** | `diskie-model`, Win32 fast enumerator, MFT backend, CLI with `scan` and a `top` listing | CLI scans C: and a UNC path; meets the scan targets in §1; fuzz and property tests on the model |
 | **2. App MVP** | Window, sidebar (drives), virtual tree-table, treemap, sync between them, live scan progress, Recycle Bin delete, dark and light themes | Daily-driveable on local disks; frame-time targets met with 10M nodes |
 | **3. Network** | Share discovery, Connect as…, multi-root scans, throttling; benchmark native SMB crates; integrate the better one | Scan a share on a real NAS and on Windows Server; credentials go only to Credential Manager |
@@ -259,7 +263,7 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 
 | Need | Crate |
 |---|---|
-| UI | `gpui`, `gpui-kit` (pinned); fallback `iced` |
+| UI | `gpui-kit = "=0.10.0"` (pins GPUI as `gpui-pre` 0.3.12) |
 | Windows APIs | `windows` (official Microsoft bindings) |
 | MFT / USN | `ntfs-reader`, `usn-journal-rs` (evaluate), else a custom parser |
 | SMB | `smb2` or `smb` (evaluate both) |

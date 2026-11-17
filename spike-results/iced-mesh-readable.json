@@ -1,0 +1,17 @@
+{
+  "framework": "iced-mesh",
+  "nodes": 2000010,
+  "rows": 2000010,
+  "treemap_rects": 3088,
+  "data_build_ms": 91.6,
+  "startup_to_first_frame_ms": 1057.5,
+  "frames": 7391,
+  "interval_ms": { "mean": 0.81, "p50": 0.80, "p95": 0.93, "p99": 1.09, "max": 3.08 },
+  "frames_over_16_7ms": 0,
+  "frames_over_33ms": 0,
+  "build_ms": { "mean": 0.03, "p50": 0.03, "p95": 0.04, "p99": 0.09, "max": 0.12 },
+  "process_cpu_percent_of_one_core": 123.4,
+  "process_cpu_ms_per_frame": 1.00,
+  "working_set_mb_end": 329.5,
+  "peak_working_set_mb": 329.5
+}

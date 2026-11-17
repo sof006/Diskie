@@ -1,0 +1,17 @@
+{
+  "framework": "iced-raster",
+  "nodes": 2000010,
+  "rows": 2000010,
+  "treemap_rects": 143819,
+  "data_build_ms": 121.3,
+  "startup_to_first_frame_ms": 210.4,
+  "frames": 702,
+  "interval_ms": { "mean": 11.42, "p50": 11.07, "p95": 16.37, "p99": 19.19, "max": 22.83 },
+  "frames_over_16_7ms": 25,
+  "frames_over_33ms": 0,
+  "build_ms": { "mean": 0.03, "p50": 0.03, "p95": 0.03, "p99": 0.04, "max": 0.08 },
+  "process_cpu_percent_of_one_core": 97.6,
+  "process_cpu_ms_per_frame": 11.14,
+  "working_set_mb_end": 105.5,
+  "peak_working_set_mb": 105.5
+}
