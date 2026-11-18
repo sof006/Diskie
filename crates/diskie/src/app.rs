@@ -167,7 +167,18 @@ pub struct Diskie {
     moving_window: bool,
     update: UpdateState,
     notice: Option<(String, bool)>,
+    /// A delete under way, shown as a progress bar in place of the notice.
+    deleting: Option<Deleting>,
     _tasks: Vec<Task<()>>,
+}
+
+struct Deleting {
+    name: String,
+    permanent: bool,
+    /// Files, folders and links the scan found in it: what the bar counts toward.
+    total: u64,
+    progress: Arc<crate::files::Deletion>,
+    started: Instant,
 }
 
 impl Diskie {
@@ -192,6 +203,7 @@ impl Diskie {
             moving_window: false,
             update: UpdateState::Idle,
             notice: startup_notice.map(|n| (n, false)),
+            deleting: None,
             _tasks: Vec::new(),
         };
         let obs = cx.observe_window_appearance(window, |this: &mut Self, window, cx| {
@@ -439,7 +451,14 @@ impl Diskie {
         if !removable(&l.tree, n) {
             return;
         }
+        if let Some(d) = &self.deleting {
+            self.notice = Some((format!("Wait until {} is done.", busy_text(d)), true));
+            cx.notify();
+            return;
+        }
         let path = l.tree.path(n);
+        let scan = l.scan;
+        let total = l.tree.files[n as usize] as u64 + l.tree.dirs[n as usize] as u64 + l.tree.is_dir(n) as u64;
         if !permanent && !volumes::has_recycle_bin(Path::new(&path)) {
             self.notice = Some((words::NO_BIN.into(), true));
             cx.notify();
@@ -470,22 +489,54 @@ impl Diskie {
             if answer.await != Ok(0) {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
-                this.notice = Some((format!("Deleting {name}…"), false));
+            let progress = Arc::new(crate::files::Deletion::default());
+            let started = this.update(cx, |this, cx| {
+                if let Some(d) = &this.deleting {
+                    this.notice = Some((format!("Wait until {} is done.", busy_text(d)), true));
+                    cx.notify();
+                    return false;
+                }
+                this.deleting =
+                    Some(Deleting { name: name.clone(), permanent, total, progress: progress.clone(), started: Instant::now() });
+                this.notice = None;
+                // Repaint the bar ten times a second until the delete is over.
+                let ticker = cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(100)).await;
+                        let busy = this.update(cx, |this, cx| {
+                            cx.notify();
+                            this.deleting.is_some()
+                        });
+                        if !matches!(busy, Ok(true)) {
+                            break;
+                        }
+                    }
+                });
+                this._tasks.push(ticker);
                 cx.notify();
+                true
             });
-            let p2 = path.clone();
+            if !matches!(started, Ok(true)) {
+                return;
+            }
+            let (p2, progress2) = (path.clone(), progress.clone());
             let result = cx
                 .background_spawn(async move {
                     if permanent {
-                        crate::files::delete_permanently(Path::new(&p2)).map_err(|e| e.to_string())
+                        crate::files::delete_permanently(Path::new(&p2), &progress2).map_err(|e| e.to_string())
                     } else {
                         trash::delete(&p2).map_err(|e| e.to_string())
                     }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.deleting = None;
+                // After a rescan, `n` is some other item.
+                let same_scan = this.loaded.as_ref().is_some_and(|l| l.scan == scan);
                 match result {
+                    Ok(()) if !same_scan => {
+                        this.notice = Some((format!("Deleted {name}. Rescan (F5) to see the space it freed."), false));
+                    }
                     Ok(()) => {
                         if let Some(l) = this.loaded.as_mut() {
                             let tree = Arc::make_mut(&mut l.tree);
@@ -511,7 +562,17 @@ impl Diskie {
                     }
                     // A folder may be partly deleted by now, so the tree no longer says what's left.
                     Err(e) if permanent => {
-                        this.notice = Some((format!("Couldn't delete all of {name}: {e}. Rescan (F5) to see what is left."), true))
+                        let (removed, freed) = (progress.removed.load(Relaxed), progress.bytes.load(Relaxed));
+                        let done =
+                            format!("{} of {} items ({}) were deleted", fmt::count(removed.min(total)), fmt::count(total), fmt::size(freed));
+                        this.notice = Some(if progress.stopping() {
+                            (format!("Stopped deleting {name}: {done}. Rescan (F5) to see what is left."), false)
+                        } else {
+                            (format!("Couldn't delete all of {name}: {e}. {done}; rescan (F5) to see what is left."), true)
+                        });
+                        if let Some(l) = this.loaded.as_mut() {
+                            l.space = volumes::space(&l.root);
+                        }
                     }
                     Err(e) => this.notice = Some((format!("Could not move {name} to the {}: {e}", words::BIN), true)),
                 }
@@ -1329,6 +1390,78 @@ impl Diskie {
             )
     }
 
+    /// While something is being deleted: what, how far along, and a Stop button for a
+    /// permanent delete. Moving to the Recycle Bin reports no progress, so its bar sweeps.
+    fn deleting_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        const BAR_W: f32 = 200.0;
+        let t = self.theme;
+        let d = self.deleting.as_ref()?;
+        let removed = d.progress.removed.load(Relaxed).min(d.total);
+        let (text, frac) = if d.permanent {
+            let text = format!(
+                "Deleting {} · {} of {} items · {} freed",
+                d.name,
+                fmt::count(removed),
+                fmt::count(d.total),
+                fmt::size(d.progress.bytes.load(Relaxed))
+            );
+            (text, Some(removed as f32 / d.total.max(1) as f32))
+        } else {
+            (format!("Moving {} to the {}…", d.name, words::BIN), None)
+        };
+        let fill = div().h_full().rounded(px(2.)).bg(rgb(t.accent));
+        let fill = match frac {
+            Some(f) => fill.w(px(BAR_W * f)),
+            None => {
+                let sweep = (d.started.elapsed().as_secs_f32() * 150.0) % (BAR_W + 60.0) - 60.0;
+                fill.w(px(60.)).ml(px(sweep))
+            }
+        };
+        let stopping = d.progress.stopping();
+        Some(
+            div()
+                .h(px(30.))
+                .flex_none()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .bg(rgb(t.panel))
+                .border_b_1()
+                .border_color(rgb(t.line))
+                .text_size(px(12.))
+                .text_color(rgb(t.muted))
+                .child(div().flex_1().min_w_0().truncate().child(text))
+                .child(div().flex_none().w(px(BAR_W)).h(px(4.)).rounded(px(2.)).bg(rgb(t.track)).overflow_hidden().child(fill))
+                .when_some(frac, |row, f| {
+                    row.child(div().flex_none().w(px(34.)).text_right().font_family(words::MONO_FONT).child(format!("{:.0}%", f * 100.0)))
+                })
+                .when(d.permanent, |row| {
+                    row.child(
+                        div()
+                            .id("stop-delete")
+                            .flex_none()
+                            .h(px(22.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(rgb(t.btn_line))
+                            .text_color(rgb(t.text))
+                            .when(!stopping, |b| b.cursor_pointer().hover(|s| s.bg(rgba(t.hover))))
+                            .child(if stopping { "Stopping…" } else { "Stop" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(d) = &this.deleting {
+                                    d.progress.stop();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                }),
+        )
+    }
+
     fn status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
         let left = if let Some(l) = &self.loaded {
@@ -1479,7 +1612,9 @@ impl Render for Diskie {
             _ => self.empty_state().into_any_element(),
         };
 
-        let notice = self.notice.clone().map(|(text, error)| {
+        let deleting = self.deleting_bar(cx);
+        let notice = if deleting.is_some() { None } else { self.notice.clone() };
+        let notice = notice.map(|(text, error)| {
             div()
                 .h(px(30.))
                 .flex_none()
@@ -1544,7 +1679,7 @@ impl Render for Diskie {
                     .min_h_0()
                     .flex()
                     .child(self.sidebar(cx))
-                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().children(notice).child(div().flex_1().min_h_0().child(main))),
+                    .child(div().flex_1().min_w_0().h_full().flex().flex_col().children(deleting).children(notice).child(div().flex_1().min_h_0().child(main))),
             )
             .child(self.status_bar(cx))
             .children(menu)
@@ -1567,6 +1702,11 @@ fn num(s: String, w: f32) -> Div {
 
 /// Whether `n` can be deleted: not the scanned folder itself, not a synthetic entry, and not a
 /// mount point, whose contents belong to another file system the scan never entered.
+/// "deleting X", or "moving X to the Recycle Bin", for asking to wait.
+fn busy_text(d: &Deleting) -> String {
+    if d.permanent { format!("deleting {}", d.name) } else { format!("moving {} to the {}", d.name, words::BIN) }
+}
+
 fn removable(tree: &Tree, n: u32) -> bool {
     n != Tree::ROOT && !tree.has(n, flag::SYNTHETIC) && !tree.has(n, flag::MOUNT)
 }

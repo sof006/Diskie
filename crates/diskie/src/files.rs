@@ -1,7 +1,10 @@
 //! Showing a file in the system's file manager, and deleting for good.
 
+use std::fs::Metadata;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Opens the file manager at `path`'s folder with `path` selected. Blocks briefly: run it off
 /// the UI thread.
@@ -97,31 +100,90 @@ fn file_uri(path: &Path) -> String {
     out
 }
 
+/// Live counts from [`delete_permanently`], read by the window while it runs.
+#[derive(Default)]
+pub struct Deletion {
+    /// Files, folders and links deleted so far.
+    pub removed: AtomicU64,
+    /// Bytes in the files deleted so far.
+    pub bytes: AtomicU64,
+    stop: AtomicBool,
+}
+
+impl Deletion {
+    /// Asks the delete to stop before the next item. What is gone stays gone.
+    pub fn stop(&self) {
+        self.stop.store(true, Relaxed);
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.stop.load(Relaxed)
+    }
+}
+
 /// Deletes `path` without the Recycle Bin or Trash: a folder with everything in it, a file, or a
-/// link (only the link itself, never what it points to).
-pub fn delete_permanently(path: &Path) -> io::Result<()> {
+/// link (only the link itself, never what it points to). Counts into `progress` as it goes, and
+/// fails with [`io::ErrorKind::Interrupted`] once [`Deletion::stop`] is called.
+pub fn delete_permanently(path: &Path, progress: &Deletion) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
+    remove(path, &meta, progress)
+}
+
+fn remove(path: &Path, meta: &Metadata, progress: &Deletion) -> io::Result<()> {
+    if progress.stopping() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+    }
     let ft = meta.file_type();
-    if ft.is_symlink() {
+    // `is_dir` is false for links and junctions, so they are never entered.
+    if ft.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            // Doesn't follow links, and on Windows comes free with the folder listing.
+            let meta = entry.metadata()?;
+            remove(&entry.path(), &meta, progress)?;
+        }
+        remove_dir(path, meta)?;
+    } else if ft.is_symlink() {
         #[cfg(windows)]
         if std::os::windows::fs::FileTypeExt::is_symlink_dir(&ft) {
             // Directory links and junctions are removed as folders, without entering them.
-            return std::fs::remove_dir(path);
+            std::fs::remove_dir(path)?;
+            progress.removed.fetch_add(1, Relaxed);
+            return Ok(());
         }
-        return std::fs::remove_file(path);
+        std::fs::remove_file(path)?;
+    } else {
+        unless_read_only(path, meta, |p| std::fs::remove_file(p))?;
+        progress.bytes.fetch_add(meta.len(), Relaxed);
     }
-    if ft.is_dir() {
-        // Doesn't follow links or junctions inside the folder.
-        return std::fs::remove_dir_all(path);
+    progress.removed.fetch_add(1, Relaxed);
+    Ok(())
+}
+
+/// Removes an emptied folder. Another program (an indexer or virus scanner) can briefly hold a
+/// file open, which keeps it in the folder for a moment after it was deleted, so wait for it.
+fn remove_dir(path: &Path, meta: &Metadata) -> io::Result<()> {
+    let mut wait = 10;
+    loop {
+        match unless_read_only(path, meta, |p| std::fs::remove_dir(p)) {
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty && wait <= 320 => {
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+                wait *= 2;
+            }
+            r => return r,
+        }
     }
-    match std::fs::remove_file(path) {
-        // A read-only file: Explorer deletes those too, so clear the flag and try again.
+}
+
+/// Runs `op`, and if a read-only flag is in the way, clears it and tries again, as Explorer does.
+fn unless_read_only(path: &Path, meta: &Metadata, op: fn(&Path) -> io::Result<()>) -> io::Result<()> {
+    match op(path) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && meta.permissions().readonly() => {
             let mut perms = meta.permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             std::fs::set_permissions(path, perms)?;
-            std::fs::remove_file(path)
+            op(path)
         }
         r => r,
     }
@@ -149,15 +211,34 @@ mod tests {
         let mut p = std::fs::metadata(&ro).unwrap().permissions();
         p.set_readonly(true);
         std::fs::set_permissions(&ro, p.clone()).unwrap();
+        // Windows won't remove a read-only folder either, until the flag is cleared.
+        #[cfg(windows)]
+        std::fs::set_permissions(&inner, p.clone()).unwrap();
         let lone = d.join("lone-read-only.txt");
         std::fs::write(&lone, b"x").unwrap();
         std::fs::set_permissions(&lone, p).unwrap();
 
-        delete_permanently(&lone).unwrap();
+        delete_permanently(&lone, &Deletion::default()).unwrap();
         assert!(!lone.exists());
-        delete_permanently(&d.join("folder")).unwrap();
+        let counted = Deletion::default();
+        delete_permanently(&d.join("folder"), &counted).unwrap();
         assert!(!d.join("folder").exists());
-        assert!(delete_permanently(&d.join("missing")).is_err());
+        // Two files and two folders, one byte each file.
+        assert_eq!((counted.removed.load(Relaxed), counted.bytes.load(Relaxed)), (4, 2));
+        assert!(delete_permanently(&d.join("missing"), &Deletion::default()).is_err());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_stopped_delete_leaves_the_rest() {
+        let d = temp("stop");
+        std::fs::create_dir_all(d.join("folder")).unwrap();
+        std::fs::write(d.join("folder").join("a.txt"), b"x").unwrap();
+        let stopped = Deletion::default();
+        stopped.stop();
+        let e = delete_permanently(&d.join("folder"), &stopped).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Interrupted);
+        assert!(d.join("folder").join("a.txt").exists());
         std::fs::remove_dir_all(&d).unwrap();
     }
 
@@ -169,7 +250,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("keep.txt"), b"x").unwrap();
         std::os::unix::fs::symlink(&target, d.join("link")).unwrap();
-        delete_permanently(&d.join("link")).unwrap();
+        delete_permanently(&d.join("link"), &Deletion::default()).unwrap();
         assert!(!d.join("link").exists());
         assert!(target.join("keep.txt").exists());
         std::fs::remove_dir_all(&d).unwrap();
@@ -185,7 +266,7 @@ mod tests {
         let link = d.join("junction");
         let made = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(&target).output().unwrap();
         assert!(made.status.success(), "{made:?}");
-        delete_permanently(&link).unwrap();
+        delete_permanently(&link, &Deletion::default()).unwrap();
         assert!(!link.exists());
         assert!(target.join("keep.txt").exists());
         std::fs::remove_dir_all(&d).unwrap();

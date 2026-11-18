@@ -2,7 +2,7 @@
 
 A fast disk space analyzer written entirely in Rust, in the same space as TreeSize and WizTree.
 
-> **Status: 0.2.1 preview.** Scanning, the linked tree and treemap, file types, clean-up to the Recycle Bin or Trash, and self-updates work on Windows and Linux. Reports, snapshots and search are still to come. The design and roadmap are in [PLAN.md](PLAN.md); the framework choice is explained in [spikes/RESULTS.md](spikes/RESULTS.md).
+> **Status: 0.2.2 preview.** Scanning, the linked tree and treemap, file types, clean-up to the Recycle Bin or Trash, and self-updates work on Windows and Linux. Reports, snapshots and search are still to come. The design and roadmap are in [PLAN.md](PLAN.md); the framework choice is explained in [spikes/RESULTS.md](spikes/RESULTS.md).
 
 ## Download
 
@@ -24,7 +24,7 @@ Both keep themselves up to date the same way. Diskie runs as your normal user on
 | Move around | Arrow keys; Right/Left expand and collapse |
 | Zoom the treemap | Double-click or Enter; Backspace goes back up |
 | Act on a file or folder | Right-click: *Show in Explorer* (*file manager* on Linux), *Copy path*, *Move to Recycle Bin* (*Trash*) or Del |
-| Delete permanently | Shift+Del, or Shift+right-click and *Delete permanently* (always offered where there is no Recycle Bin, such as a network share) |
+| Delete permanently | Shift+Del, or Shift+right-click and *Delete permanently* (always offered where there is no Recycle Bin, such as a network share). A progress bar shows how far it has got, with a Stop button |
 | Rescan | F5 |
 
 Settings live in `%APPDATA%\Diskie\settings.json` (`~/.config/Diskie/settings.json` on Linux): `updates` (`"notify"`, `"auto"` or `"off"`), and on Windows `run_as_admin` and `use_mft`.
