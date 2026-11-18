@@ -1463,6 +1463,9 @@ impl Diskie {
             .border_color(rgb(t.btn_line))
             .rounded(px(6.))
             .shadow_md()
+            // Keep presses on the menu from reaching the row or treemap under it, which would
+            // close the menu before the item's click completes.
+            .occlude()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.menu = None;
                 cx.notify();
