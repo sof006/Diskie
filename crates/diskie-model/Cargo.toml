@@ -1,0 +1,9 @@
+[package]
+name = "diskie-model"
+version.workspace = true
+description = "The in-memory file tree, file-type classification and treemap layout behind Diskie"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

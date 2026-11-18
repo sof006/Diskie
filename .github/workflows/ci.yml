@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint
+        run: cargo clippy -p diskie-model -p diskie-scan -p diskie-update -p diskie -p xtask --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
+      - name: Build
+        run: cargo build --release -p diskie

@@ -1,0 +1,21 @@
+[package]
+name = "diskie-scan"
+version.workspace = true
+description = "Volume and folder scanners for Diskie: NTFS MFT reader and a parallel directory walker"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskie-model = { path = "../diskie-model" }
+
+[target.'cfg(windows)'.dependencies]
+ntfs-reader = "=0.6.0"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+] }

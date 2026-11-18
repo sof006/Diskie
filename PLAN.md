@@ -3,7 +3,7 @@
 A disk space analyzer written entirely in Rust, aimed at the same space as TreeSize and WizTree.
 The goals are WizTree-class scan speed, TreeSize-class features (SMB shares, reports, snapshots, owners, duplicates), a small footprint, and an interface that looks like a well-made tool, not a template.
 
-> Status: plan agreed, nothing built yet. Windows is the main platform; Linux follows as a tar.gz and an AppImage. Open source. Decisions are recorded in §8.
+> Status: **0.1.0 preview built** (2026-11-18): scanning (MFT and parallel walk), the linked tree and treemap, file types, Recycle Bin, themes and the signed self-updater. Windows is the main platform; Linux follows as a tar.gz and an AppImage. Open source. Decisions are recorded in §8.
 
 ---
 
@@ -165,8 +165,8 @@ Reveal in Explorer, open, copy path, **Delete to Recycle Bin** (default) or perm
 ### 4.8 Privileges per platform
 
 **Windows: runs as administrator by default.**
-- The app manifest sets `requestedExecutionLevel = requireAdministrator`, so a UAC prompt appears at launch and MFT scanning is always available, as with WizTree.
-- A `--no-elevate` flag and a portable-build setting allow a standard-user run, which falls back to the Win32 enumerator.
+- At launch, Diskie relaunches itself through the UAC prompt (`ShellExecute` with `runas`), so MFT scanning is available, as with WizTree. *Changed 2026-11-18:* GPUI embeds its own application manifest, so a `requireAdministrator` manifest isn't possible. Relaunching also behaves better: if the prompt is declined, Diskie carries on as a standard user instead of refusing to start.
+- A `--no-elevate` flag and the `run_as_admin` setting allow a standard-user run, which falls back to the directory walk.
 - Two Windows behaviours to handle, because elevated processes run in a separate logon session:
   1. **Mapped drive letters made by the normal user are invisible to an elevated process.** Diskie reads the user's mappings (`HKCU\Network` and `WNetGetConnection` from the unelevated token) and offers them in the sidebar as their UNC paths. UNC paths and shares added in Diskie itself always work.
   2. **Drag-and-drop from a non-elevated Explorer into an elevated window is blocked** by Windows (UIPI). Instead, the Explorer context-menu entry passes the path on the command line.
@@ -274,8 +274,8 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0. Spike** (1 week) ✅ | GPUI vs iced prototype; MFT read benchmark using `ntfs-reader` vs a custom parser | Framework chosen (GPUI). Win32 enumeration measured. The MFT run (needs an elevated shell) and on-display frame rates are still open; see [spikes/RESULTS.md](spikes/RESULTS.md) |
-| **1. Core** | `diskie-model`, Win32 fast enumerator, MFT backend, CLI with `scan` and a `top` listing; release pipeline (GitHub Actions builds, minisign-signed files, `latest.json`, see §4.9) | CLI scans C: and a UNC path; meets the scan targets in §1; fuzz and property tests on the model; a tagged build publishes a signed release |
-| **2. App MVP** | Window, sidebar (drives), virtual tree-table, treemap, sync between them, live scan progress, Recycle Bin delete, dark and light themes, in-app updater (check, verify, replace, roll back) | Daily-driveable on local disks; frame-time targets met with 10M nodes; one build updates itself to the next |
+| **1. Core** (mostly ✅ in 0.1.0) | `diskie-model`, Win32 fast enumerator, MFT backend, CLI with `scan` and a `top` listing; release pipeline (GitHub Actions builds, minisign-signed files, `latest.json`, see §4.9) | CLI scans C: and a UNC path; meets the scan targets in §1; fuzz and property tests on the model; a tagged build publishes a signed release |
+| **2. App MVP** (✅ 0.1.0, minus frame-time checks at 10M nodes) | Window, sidebar (drives), virtual tree-table, treemap, sync between them, live scan progress, Recycle Bin delete, dark and light themes, in-app updater (check, verify, replace, roll back) | Daily-driveable on local disks; frame-time targets met with 10M nodes; one build updates itself to the next |
 | **3. Network** | Share discovery, Connect as…, multi-root scans, throttling; benchmark native SMB crates; integrate the better one | Scan a share on a real NAS and on Windows Server; credentials go only to Credential Manager |
 | **4. Analysis** | File types panel, top-N, age histogram, owners, search and filters, duplicates | Each view handles 10M nodes without UI stalls |
 | **5. History and reports** | Snapshots, compare, CSV/JSON/XLSX/HTML export, scheduled scans via CLI | A snapshot round-trip is lossless; the diff view is correct on fixture trees |
@@ -317,7 +317,7 @@ A clickable mock-up exists, covering the main window in dark and light, network 
 | Platforms | Windows first. Linux in phase 7, shipped as a tar.gz and an AppImage. macOS not planned. |
 | License | Open source, dual-licensed MIT or Apache-2.0 (the Rust convention). |
 | Name | Diskie. |
-| Privileges | Windows: administrator by default, through the app manifest. Linux: normal user, Filelight-style (§4.8). |
+| Privileges | Windows: administrator by default, by relaunching through UAC at startup (a declined prompt falls back to a standard-user run). Linux: normal user, Filelight-style (§4.8). |
 | PDF reports | In v1, built with `krilla` (§4.6). |
 | Look | Amber accent; treemap with folder header strips by default. |
 | Repository | Hosted on GitHub. |

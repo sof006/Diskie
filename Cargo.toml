@@ -1,8 +1,20 @@
 [workspace]
 resolver = "3"
-members = ["spikes/spike-data", "spikes/spike-gpui", "spikes/spike-iced", "spikes/spike-scan"]
+members = [
+    "crates/diskie",
+    "crates/diskie-model",
+    "crates/diskie-scan",
+    "crates/diskie-update",
+    "xtask",
+    "spikes/spike-data",
+    "spikes/spike-gpui",
+    "spikes/spike-iced",
+    "spikes/spike-scan",
+]
+default-members = ["crates/diskie"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false

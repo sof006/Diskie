@@ -1,0 +1,19 @@
+[package]
+name = "diskie-update"
+version.workspace = true
+description = "Self-update for Diskie from GitHub Releases, with minisign signature checks"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ureq = "3"
+minisign-verify = "0.2"
+sha2 = "0.10"
+self-replace = "1"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+minisign = "0.7"

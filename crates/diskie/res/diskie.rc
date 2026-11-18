@@ -1,0 +1,29 @@
+#include <winver.h>
+
+1 ICON "diskie.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "The Diskie contributors"
+      VALUE "FileDescription", "Diskie disk space analyzer"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "InternalName", "Diskie"
+      VALUE "LegalCopyright", "MIT OR Apache-2.0"
+      VALUE "OriginalFilename", "Diskie.exe"
+      VALUE "ProductName", "Diskie"
+      VALUE "ProductVersion", "0.1.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

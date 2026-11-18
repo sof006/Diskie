@@ -1,0 +1,47 @@
+# Publishes a release when a version tag (v1.2.3) is pushed.
+#
+# The executable is signed with the project's minisign key, held in the DISKIE_SIGNING_KEY
+# secret (the contents of diskie-release.key). Diskie verifies that signature against the
+# public key in keys/diskie-release.pub before it installs any update.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
+      - name: Build
+        run: cargo build --profile dist -p diskie
+      - name: Sign and write latest.json
+        shell: bash
+        env:
+          DISKIE_SIGNING_KEY: ${{ secrets.DISKIE_SIGNING_KEY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/${version}.md"
+          [ -f "$notes" ] || { echo "missing $notes"; exit 1; }
+          export DISKIE_RELEASE_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cargo xtask release "$version" target/dist/Diskie.exe dist "$notes"
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # A full release, not a pre-release: /releases/latest only ever points at full releases,
+          # and that is where installed copies look for updates.
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Diskie ${version}" \
+            --notes-file "docs/releases/${version}.md" \
+            --verify-tag
