@@ -176,9 +176,7 @@ pub fn rasterize(tree: &Tree, rects: &[MapRect], pal: &Palette, w: u32, h: u32, 
         for y in y0..y1 {
             let start = (y as usize * w as usize + x0 as usize) * 4;
             let end = (y as usize * w as usize + x1 as usize) * 4;
-            for p in buf[start..end].chunks_exact_mut(4) {
-                p.copy_from_slice(&c);
-            }
+            buf[start..end].as_chunks_mut::<4>().0.fill(c);
         }
     }
     buf
