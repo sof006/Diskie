@@ -214,7 +214,7 @@ pub fn element(state: Rc<RefCell<MapState>>, p: Paint) -> impl IntoElement {
     .size_full()
 }
 
-/// Average advance of an 11 px Segoe UI character, for fitting labels without measuring.
+/// Average advance of an 11 px UI-font character, for fitting labels without measuring.
 const CHAR_W: f32 = 6.4;
 
 #[allow(clippy::too_many_arguments)]

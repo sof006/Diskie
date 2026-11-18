@@ -5,6 +5,10 @@
 //! extra call per file), records every entry in its own [`Chunk`] and pushes the subfolders back
 //! on the stack. The stack is LIFO, so workers go depth-first, which keeps a hard disk's head
 //! near where it already is. Junctions and symbolic links are recorded but never followed.
+//!
+//! On Linux the walk stays on the file system it started on, like `du -x`: a folder where
+//! another file system is mounted (`/proc`, a USB stick, a network share) is recorded with
+//! [`flag::MOUNT`] and not entered. A file with several hard links is counted once.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -30,6 +34,12 @@ struct Queue {
     pending: AtomicUsize,
     /// A worker panicked: the others stop instead of waiting for its jobs forever.
     failed: AtomicBool,
+    /// The device the walk started on; folders on any other are mount points.
+    #[cfg(unix)]
+    root_dev: u64,
+    /// (device, inode) of every file with more than one hard link seen so far.
+    #[cfg(unix)]
+    linked: Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 /// Wakes the other workers if this one panics.
@@ -62,7 +72,16 @@ pub fn scan(root: &Path, threads: usize, progress: &Progress) -> Result<Tree, Er
     std::fs::read_dir(root).map_err(Error::Root)?;
 
     let next_key = AtomicU64::new(ROOT_KEY + 1);
-    let q = Queue { stack: Mutex::new(vec![Job { path: root.to_path_buf(), key: ROOT_KEY }]), ready: Condvar::new(), pending: AtomicUsize::new(1), failed: AtomicBool::new(false) };
+    let q = Queue {
+        stack: Mutex::new(vec![Job { path: root.to_path_buf(), key: ROOT_KEY }]),
+        ready: Condvar::new(),
+        pending: AtomicUsize::new(1),
+        failed: AtomicBool::new(false),
+        #[cfg(unix)]
+        root_dev: std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(root).map_err(Error::Root)?),
+        #[cfg(unix)]
+        linked: Mutex::new(Default::default()),
+    };
 
     let chunks: Vec<Chunk> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads.max(1)).map(|_| s.spawn(|| worker(&q, &next_key, progress))).collect();
@@ -108,7 +127,7 @@ fn worker(q: &Queue, next_key: &AtomicU64, progress: &Progress) -> Chunk {
             if listed % 64 == 1 {
                 progress.set_current(&job.path.to_string_lossy());
             }
-            list(&job, &mut chunk, &mut found, next_key, progress);
+            list(q, &job, &mut chunk, &mut found, next_key, progress);
         }
 
         let added = found.len();
@@ -129,7 +148,7 @@ fn worker(q: &Queue, next_key: &AtomicU64, progress: &Progress) -> Chunk {
     }
 }
 
-fn list(job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64, progress: &Progress) {
+fn list(q: &Queue, job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64, progress: &Progress) {
     #[cfg(test)]
     if job.path.file_name().is_some_and(|n| n == tests::PANIC_MARKER) {
         panic!("test panic in a walk worker");
@@ -165,13 +184,17 @@ fn list(job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64
                 chunk.push(NO_KEY, job.key, &name, 0, mtime, flag::REPARSE);
                 files += 1;
             }
+        } else if ft.is_dir() && is_mount(q, meta.as_ref()) {
+            // Another file system: shown, not entered.
+            chunk.push(NO_KEY, job.key, &name, 0, mtime, flag::DIR | flag::MOUNT);
+            dirs += 1;
         } else if ft.is_dir() {
             let key = next_key.fetch_add(1, Relaxed);
             chunk.push(key, job.key, &name, 0, mtime, flag::DIR);
             found.push(Job { path: entry.path(), key });
             dirs += 1;
         } else {
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let size = if counted_before(q, meta.as_ref()) { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) };
             chunk.push(NO_KEY, job.key, &name, size, mtime, 0);
             files += 1;
             bytes += size;
@@ -180,6 +203,32 @@ fn list(job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64
     progress.files.fetch_add(files, Relaxed);
     progress.dirs.fetch_add(dirs, Relaxed);
     progress.bytes.fetch_add(bytes, Relaxed);
+}
+
+#[cfg(unix)]
+fn is_mount(q: &Queue, meta: Option<&std::fs::Metadata>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.is_some_and(|m| m.dev() != q.root_dev)
+}
+
+#[cfg(not(unix))]
+fn is_mount(_: &Queue, _: Option<&std::fs::Metadata>) -> bool {
+    false
+}
+
+/// Whether this file is another hard link to one already counted, so its bytes aren't added twice.
+#[cfg(unix)]
+fn counted_before(q: &Queue, meta: Option<&std::fs::Metadata>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match meta {
+        Some(m) if m.nlink() > 1 => !q.linked.lock().unwrap().insert((m.dev(), m.ino())),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn counted_before(_: &Queue, _: Option<&std::fs::Metadata>) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -205,6 +254,19 @@ mod tests {
         let d = std::env::temp_dir().join(format!("diskie-walk-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_count_once() {
+        let d = temp("links");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a").join("big.bin"), vec![7u8; 10_000]).unwrap();
+        std::fs::hard_link(d.join("a").join("big.bin"), d.join("same.bin")).unwrap();
+        let t = scan(&d, 4, &Progress::default()).unwrap();
+        assert_eq!(t.size[0], 10_000);
+        assert_eq!(t.files[0], 2);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

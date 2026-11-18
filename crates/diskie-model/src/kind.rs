@@ -59,6 +59,10 @@ impl Kind {
             return Kind::Other;
         };
         let ext = &name[dot + 1..];
+        // Linux libraries carry their version after the extension: `libLLVM-15.so.1`, `libc.so.6.2`.
+        if ext.bytes().all(|b| b.is_ascii_digit()) && !ext.is_empty() && name.contains(".so.") {
+            return Kind::Apps;
+        }
         if ext.is_empty() || ext.len() > 10 {
             return Kind::Other;
         }
@@ -108,5 +112,8 @@ mod tests {
         assert_eq!(Kind::of_name("README"), Kind::Other);
         assert_eq!(Kind::of_name(".gitignore"), Kind::Other);
         assert_eq!(Kind::of_name("trailing."), Kind::Other);
+        assert_eq!(Kind::of_name("libLLVM-15.so.1"), Kind::Apps);
+        assert_eq!(Kind::of_name("libc.so.6.2"), Kind::Apps);
+        assert_eq!(Kind::of_name("notes.so.what"), Kind::Other);
     }
 }

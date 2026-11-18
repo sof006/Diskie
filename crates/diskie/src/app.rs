@@ -17,6 +17,7 @@ use gpui_kit::*;
 use crate::icons;
 use crate::settings::{self, Settings, UpdateMode};
 use crate::theme::Theme;
+use crate::words;
 use crate::treemap_view::{self, MapState, Paint};
 
 const ROW_H: f32 = 24.0;
@@ -152,6 +153,8 @@ pub struct Diskie {
     map_job: Option<Task<()>>,
     menu: Option<Menu>,
     dragging_split: bool,
+    /// The toolbar was pressed where it moves the window; the move starts once the mouse moves.
+    moving_window: bool,
     update: UpdateState,
     notice: Option<(String, bool)>,
     _tasks: Vec<Task<()>>,
@@ -176,6 +179,7 @@ impl Diskie {
             map_job: None,
             menu: None,
             dragging_split: false,
+            moving_window: false,
             update: UpdateState::Idle,
             notice: startup_notice.map(|n| (n, false)),
             _tasks: Vec::new(),
@@ -417,10 +421,7 @@ impl Diskie {
         }
         let path = l.tree.path(n);
         if !volumes::has_recycle_bin(Path::new(&path)) {
-            self.notice = Some((
-                "This location has no Recycle Bin (network share or removable drive), so Diskie won't delete here. Use Explorer if you mean to delete it permanently.".into(),
-                true,
-            ));
+            self.notice = Some((words::NO_BIN.into(), true));
             cx.notify();
             return;
         }
@@ -430,10 +431,13 @@ impl Diskie {
         } else {
             format!("{}.\n{path}", fmt::size(l.tree.size[n as usize]))
         };
-        if is_system_path(&path) {
-            detail.push_str("\n\nThis is inside a Windows system folder. Removing it can stop Windows or installed programs from working.");
+        if words::is_system_path(&path) {
+            detail.push_str("\n\n");
+            detail.push_str(words::SYSTEM_WARNING);
         }
-        let answer = window.prompt(PromptLevel::Warning, &format!("Move “{name}” to the Recycle Bin?"), Some(&detail), &["Move to Recycle Bin", "Cancel"], cx);
+        let bin = words::BIN;
+        let confirm = format!("Move to {bin}");
+        let answer = window.prompt(PromptLevel::Warning, &format!("Move “{name}” to the {bin}?"), Some(&detail), &[confirm.as_str(), "Cancel"], cx);
         self.menu = None;
         let task = cx.spawn(async move |this, cx| {
             if answer.await != Ok(0) {
@@ -456,10 +460,10 @@ impl Diskie {
                             l.selected = Some(parent);
                             l.rebuild_rows();
                             l.space = volumes::space(&l.root);
-                            this.notice = Some((format!("Moved {name} to the Recycle Bin ({})", fmt::size(freed)), false));
+                            this.notice = Some((format!("Moved {name} to the {} ({})", words::BIN, fmt::size(freed)), false));
                         }
                     }
-                    Err(e) => this.notice = Some((format!("Could not move {name} to the Recycle Bin: {e}"), true)),
+                    Err(e) => this.notice = Some((format!("Could not move {name} to the {}: {e}", words::BIN), true)),
                 }
                 cx.notify();
             });
@@ -562,7 +566,7 @@ impl Diskie {
             _ => diskie_update::current_exe(),
         };
         if let Ok(exe) = exe {
-            let mut cmd = std::process::Command::new(exe);
+            let mut cmd = diskie_update::restart_command(&exe);
             // Restart with the same rights: an elevated copy starts elevated, and a standard-user
             // copy (prompt declined, or turned off) doesn't ask again.
             if !self.elevated {
@@ -642,9 +646,13 @@ impl Diskie {
             .hover(|s| s.bg(rgba(t.hover)))
             .child(self.icon(icon, t.muted))
             .when(!label.is_empty(), |d| d.child(label))
+            // In a self-drawn frame the toolbar moves the window; a press on a button doesn't.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
     }
 
-    fn toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// `frame` is `Some(maximized)` when Diskie draws its own window frame: the toolbar then
+    /// doubles as the title bar.
+    fn toolbar(&mut self, frame: Option<bool>, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
         let mut crumbs = div().flex().items_center().gap_1().min_w_0().overflow_hidden();
         if let Some(l) = &self.loaded {
@@ -666,6 +674,7 @@ impl Diskie {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgba(t.hover)))
                         .child(name)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| this.zoom_to(n, cx))),
                 );
             }
@@ -696,6 +705,24 @@ impl Diskie {
                     .on_click(cx.listener(|this, _, window, cx| this.rescan(window, cx))),
             )
             .child(self.button("open", "folder", "Scan folder or share…").on_click(cx.listener(|this, _, window, cx| this.pick_folder(window, cx))))
+            .when_some(frame, |d, maximized| {
+                d.child(crate::frame::controls(t, maximized, |name, color| self.icon(name, color)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                        if ev.click_count >= 2 {
+                            this.moving_window = false;
+                            window.zoom_window();
+                        } else {
+                            this.moving_window = true;
+                        }
+                    }))
+                    .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, window, _| {
+                        if std::mem::take(&mut this.moving_window) {
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.moving_window = false))
+                    .on_mouse_down(MouseButton::Right, |ev: &MouseDownEvent, window, _| window.show_window_menu(ev.position))
+            })
     }
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -772,14 +799,10 @@ impl Diskie {
                 .pt_1()
                 .text_size(px(11.))
                 .text_color(rgb(t.faint))
-                .child(r"Type a \\server\share path into the folder box to scan a network share."),
+                .child(words::NETWORK_HINT),
         );
 
-        let (mode_icon, mode) = if self.elevated {
-            ("shield", "Administrator · fast MFT scans")
-        } else {
-            ("lock", "Standard user · folder walk")
-        };
+        let (mode_icon, mode) = words::mode(self.elevated);
         div()
             .w(px(SIDEBAR_W))
             .flex_none()
@@ -824,7 +847,8 @@ impl Diskie {
                 let depth = tree.depth[ni] as f32;
                 let unreadable = tree.has(n, flag::UNREADABLE);
                 let link = tree.has(n, flag::REPARSE);
-                let name_color = if unreadable || link { t.muted } else { t.text };
+                let mount = tree.has(n, flag::MOUNT);
+                let name_color = if unreadable || link || mount { t.muted } else { t.text };
                 let chevron = if has_kids {
                     self.icon(if expanded { "chevron-down" } else { "chevron-right" }, t.muted).size(px(14.))
                 } else {
@@ -832,6 +856,8 @@ impl Diskie {
                 };
                 let glyph = if link {
                     "link"
+                } else if mount {
+                    "drive"
                 } else if is_dir {
                     "folder"
                 } else {
@@ -855,6 +881,8 @@ impl Diskie {
                     name = name.child(tag("no access", t));
                 } else if link {
                     name = name.child(tag("link", t));
+                } else if mount {
+                    name = name.child(tag("other drive", t));
                 }
                 div()
                     .id(("row", ni))
@@ -894,7 +922,13 @@ impl Diskie {
                         this.focus.focus(window, cx);
                         this.menu = None;
                         if ev.click_count >= 2 {
-                            if is_dir {
+                            if mount {
+                                // Another file system isn't part of this scan: scan it on its own.
+                                if let Some(l) = &this.loaded {
+                                    let path = PathBuf::from(l.tree.path(n));
+                                    this.start_scan(path, window, cx);
+                                }
+                            } else if is_dir {
                                 this.zoom_to(n, cx);
                             } else {
                                 this.reveal_in_explorer(n, cx);
@@ -1135,7 +1169,7 @@ impl Diskie {
                     this.zoom_to(n, cx);
                 })))
             })
-            .child(item("m-reveal", "external", "Show in Explorer", t.text).on_click(cx.listener(move |this, _, _, cx| {
+            .child(item("m-reveal", "external", words::SHOW_IN_FILES, t.text).on_click(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
                 this.reveal_in_explorer(n, cx);
                 cx.notify();
@@ -1146,7 +1180,7 @@ impl Diskie {
             })))
             .when(deletable, |d| {
                 d.child(div().my_1().h(px(1.)).bg(rgb(t.line))).child(
-                    item("m-trash", "trash", "Move to Recycle Bin…", t.danger)
+                    item("m-trash", "trash", words::MOVE_TO_BIN, t.danger)
                         .on_click(cx.listener(move |this, _, window, cx| this.recycle(n, window, cx))),
                 )
             });
@@ -1173,7 +1207,7 @@ impl Diskie {
                     .text_size(px(12.))
                     .child(line("Drives", "Pick one on the left."))
                     .child(line("Folder or share", "Ctrl+O, or the button at the top right."))
-                    .child(line("In the results", "Arrows move, Enter zooms in, Backspace goes up, Del moves to the Recycle Bin.")),
+                    .child(line("In the results", words::KEYS_HINT)),
             )
     }
 
@@ -1214,7 +1248,7 @@ impl Diskie {
                         .ml(px((((secs * 260.0) % 540.0) - 120.0) as f32)),
                 ),
             )
-            .child(div().text_size(px(12.)).text_color(rgb(t.faint)).font_family("Cascadia Mono").truncate().child(progress.current()))
+            .child(div().text_size(px(12.)).text_color(rgb(t.faint)).font_family(words::MONO_FONT).truncate().child(progress.current()))
             .child(
                 div()
                     .id("cancel")
@@ -1344,6 +1378,8 @@ impl Render for Diskie {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.schedule_map(cx);
         let t = self.theme;
+        let tiling = crate::frame::client_frame(window);
+        let maximized = window.is_maximized();
         let viewport_h = window.viewport_size().height.as_f32();
         let content_h = (viewport_h - TOOLBAR_H - STATUS_H).max(100.0);
         let map_h = (content_h * self.settings.treemap_share.clamp(0.15, 0.85)).round();
@@ -1416,11 +1452,14 @@ impl Render for Diskie {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(t.canvas))
+            // A self-drawn frame needs an edge of its own, or the window melts into whatever is behind it.
+            .when(tiling.is_some() && !maximized, |d| d.border_1().border_color(rgb(t.chrome_line)))
             .text_color(rgb(t.text))
-            .font_family("Segoe UI")
+            .font_family(words::UI_FONT)
             .text_size(px(13.))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, window, cx| {
                 if this.dragging_split {
@@ -1438,7 +1477,7 @@ impl Render for Diskie {
                     cx.notify();
                 }
             }))
-            .child(self.toolbar(cx))
+            .child(self.toolbar(tiling.map(|_| maximized), cx))
             .child(
                 div()
                     .flex_1()
@@ -1449,6 +1488,7 @@ impl Render for Diskie {
             )
             .child(self.status_bar(cx))
             .children(menu)
+            .children(tiling.map(|tiling| crate::frame::resize_handles(tiling, maximized)).unwrap_or_default())
     }
 }
 
@@ -1467,15 +1507,4 @@ fn num(s: String, w: f32) -> Div {
 
 fn tag(s: &'static str, t: Theme) -> Div {
     div().flex_none().px_1().rounded(px(3.)).border_1().border_color(rgb(t.btn_line)).text_size(px(10.)).text_color(rgb(t.muted)).child(s)
-}
-
-fn is_system_path(p: &str) -> bool {
-    let lower = p.to_ascii_lowercase();
-    let win = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()).to_ascii_lowercase();
-    [win.as_str(), r"c:\program files", r"c:\program files (x86)", r"c:\programdata"]
-        .iter()
-        .any(|s| lower == *s || lower.starts_with(&format!("{s}\\")))
-        || lower.ends_with(r"\pagefile.sys")
-        || lower.ends_with(r"\hiberfil.sys")
-        || lower.ends_with(r"\swapfile.sys")
 }

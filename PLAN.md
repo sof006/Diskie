@@ -3,7 +3,7 @@
 A disk space analyzer written entirely in Rust, aimed at the same space as TreeSize and WizTree.
 The goals are WizTree-class scan speed, TreeSize-class features (SMB shares, reports, snapshots, owners, duplicates), a small footprint, and an interface that looks like a well-made tool, not a template.
 
-> Status: **0.1.3 preview released** (2026-11-18): scanning (MFT and parallel walk), the linked tree and treemap, file types, Recycle Bin, themes and the signed self-updater. Windows is the main platform; Linux follows as a tar.gz and an AppImage. Open source. Decisions are recorded in §8.
+> Status: **0.2.0 preview released** (2026-11-18): scanning (MFT and parallel walk), the linked tree and treemap, file types, Recycle Bin, themes and the signed self-updater. Windows is the main platform. **Linux (phase 7) shipped in 0.2.0**: mounts and free space, a one-file-system walk that counts hard links once, a self-drawn window frame where the desktop has none, Trash, and the tar.gz and AppImage with self-update, tested under WSLg (Wayland). Still open for Linux: testing on X11 and real Ubuntu, Fedora and Arch desktops, and the built-in SMB client. Open source. Decisions are recorded in §8.
 
 ---
 
@@ -195,8 +195,8 @@ Diskie keeps itself current from the project's GitHub Releases, so nobody has to
 1. It downloads the file, then **verifies the SHA-256 and the minisign signature against the public key compiled into Diskie** before touching anything. This matters doubly because Diskie runs as administrator on Windows: an unsigned or tampered file is rejected, and HTTPS alone is not trusted to be enough.
 2. **Windows, portable `.exe`:** a running executable can't be overwritten, but it can be renamed. Diskie renames itself to `Diskie.old.exe`, puts the new file in its place (the `self-replace` crate), and offers *Restart now*.
 3. **Windows, MSI install:** it downloads the new `.msi` and hands it to `msiexec`, so Programs and Features stays accurate.
-4. **Linux AppImage:** it replaces the file `$APPIMAGE` points to. The AppImage also carries zsync update information, so tools such as AppImageUpdate work too.
-5. **Linux tar.gz:** it replaces the binary only if the user can write to it. Otherwise it shows where to download.
+4. **Linux AppImage:** it replaces the file `$APPIMAGE` points to (and renames it to the new version, as on Windows). zsync update information for AppImageUpdate is not embedded yet.
+5. **Linux tar.gz:** `install.sh` puts the binary in `~/.local/bin`, and Diskie replaces it from the release's bare `Diskie-<version>-linux-x64` download. A binary the user can't write to, or one under `/usr`, `/opt`, `/nix` or `/snap` (a package), is left to whatever installed it.
 6. Builds packaged by a distribution, if any appear, turn self-update off and leave updates to the package manager.
 
 **Safety:** if the new version fails to start cleanly twice, Diskie restores `Diskie.old.exe` (or the previous AppImage) on the next launch and says why. The old copy is deleted after the first successful run of the new one.

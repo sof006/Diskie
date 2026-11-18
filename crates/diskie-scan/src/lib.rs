@@ -141,6 +141,7 @@ impl std::error::Error for Error {}
 pub fn scan(root: &Path, opts: Options, progress: &Progress) -> Result<Scan, Error> {
     let t0 = Instant::now();
     let root = normalize(root);
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut fallback = None;
 
     #[cfg(windows)]

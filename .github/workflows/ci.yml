@@ -7,9 +7,17 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux builds on the oldest supported Ubuntu, so the binary runs on older glibc too.
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo sh packaging/linux/build-deps.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

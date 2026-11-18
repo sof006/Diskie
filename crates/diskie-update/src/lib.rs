@@ -10,6 +10,9 @@
 //! 3. [`install`] keeps a copy of the running executable as `Diskie.old.exe` and swaps the new
 //!    one in (a running `.exe` can be renamed but not overwritten). [`on_startup`] rolls back
 //!    if the new version fails to start cleanly twice; [`confirm_healthy`] clears that state.
+//!
+//! On Linux the file replaced is the AppImage (`$APPIMAGE`) when Diskie runs from one, or else
+//! the `diskie` binary itself (the tar.gz install). Each has its own download in the manifest.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -84,18 +87,38 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The asset key for this build.
+/// The asset key for this copy: the build's platform, and on Linux whether it runs as an AppImage.
 pub fn platform() -> &'static str {
     if cfg!(all(windows, target_arch = "x86_64")) {
         "windows-x86_64"
     } else if cfg!(all(windows, target_arch = "aarch64")) {
         "windows-aarch64"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x86_64"
+        if appimage().is_some() { "linux-x86_64-appimage" } else { "linux-x86_64" }
     } else {
         "unknown"
     }
 }
+
+/// The AppImage file this copy runs from. Its own executable is inside a temporary read-only
+/// mount, so updates replace this file instead.
+fn appimage() -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_absolute() && p.is_file())
+}
+
+/// The file name a version is published under for `platform`, for example
+/// `Diskie-0.1.1-windows-x64.exe`.
+pub fn asset_file_name(platform: &str, version: &str) -> Option<String> {
+    let (_, suffix) = ASSET_NAMES.iter().find(|(p, _)| *p == platform)?;
+    Some(format!("Diskie-{version}{suffix}"))
+}
+
+/// Platform key → what follows the version in the file name.
+const ASSET_NAMES: &[(&str, &str)] =
+    &[("windows-x86_64", "-windows-x64.exe"), ("linux-x86_64", "-linux-x64"), ("linux-x86_64-appimage", "-x86_64.AppImage")];
 
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
@@ -238,6 +261,10 @@ pub fn can_self_update() -> Result<(), Error> {
         return Err(Error::Unsupported("updates are managed by the package that installed Diskie"));
     }
     let exe = current_exe().map_err(|e| Error::Install(e.to_string()))?;
+    // Installed by a package manager: that is what updates it.
+    if cfg!(target_os = "linux") && (exe.starts_with("/usr") || exe.starts_with("/opt") || exe.starts_with("/nix") || exe.starts_with("/snap")) {
+        return Err(Error::Unsupported("updates are managed by the package that installed Diskie"));
+    }
     let dir = exe.parent().ok_or(Error::Unsupported("cannot tell where Diskie is installed"))?;
     let probe = dir.join(".diskie-write-test");
     match std::fs::write(&probe, b"") {
@@ -259,7 +286,7 @@ pub fn install(downloaded: &Path, from_version: &str, to_version: &str) -> Resul
     can_self_update()?;
     let exe = current_exe().map_err(|e| Error::Install(e.to_string()))?;
     std::fs::copy(&exe, backup_path(&exe)).map_err(|e| Error::Install(format!("keeping the old version: {e}")))?;
-    self_replace::self_replace(downloaded).map_err(|e| Error::Install(e.to_string()))?;
+    replace_exe(&exe, downloaded).map_err(|e| Error::Install(e.to_string()))?;
     let _ = std::fs::remove_file(downloaded);
     if let Some(p) = state_path() {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
@@ -269,18 +296,59 @@ pub fn install(downloaded: &Path, from_version: &str, to_version: &str) -> Resul
     Ok(rename_for_version(&exe, to_version))
 }
 
-/// The file name a version is published under: `Diskie-0.1.1-windows-x64.exe`.
+/// Puts `new` in place of the running executable `exe`.
+#[cfg(windows)]
+fn replace_exe(_exe: &Path, new: &Path) -> std::io::Result<()> {
+    // A running .exe can't be overwritten, only renamed out of the way; self_replace does that.
+    self_replace::self_replace(new)
+}
+
+/// Puts `new` in place of `exe` (the binary or the AppImage). A rename within the folder is
+/// atomic, and the running copy keeps the old file's contents until it exits.
+#[cfg(unix)]
+fn replace_exe(exe: &Path, new: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let name = exe.file_name().ok_or_else(|| std::io::Error::other("no file name"))?;
+    let tmp = exe.with_file_name(format!(".{}.new", name.to_string_lossy()));
+    let result = (|| {
+        std::fs::copy(new, &tmp)?;
+        let mode = std::fs::metadata(exe).map(|m| m.permissions().mode()).unwrap_or(0o755) | 0o700;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, exe)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A command that starts `exe` as a new copy of Diskie, for restarting after an update or a
+/// rollback. On Linux it runs in its own process group, so it outlives the copy that started it
+/// even when that one was started from a terminal (the terminal's hang-up would end both).
+pub fn restart_command(exe: &Path) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(exe);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd
+}
+
+/// The file name a version is published under for this copy: `Diskie-0.1.1-windows-x64.exe`.
 pub fn release_file_name(version: &str) -> String {
-    format!("Diskie-{version}-windows-x64.exe")
+    asset_file_name(platform(), version).unwrap_or_else(|| format!("Diskie-{version}"))
 }
 
 /// Set when Diskie renames its own executable while running.
 static RENAMED_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Where this executable is now. Like `std::env::current_exe()`, but it follows a rename Diskie
-/// made itself: Windows keeps reporting the path a program was started from.
+/// made itself (Windows keeps reporting the path a program was started from), and in an
+/// AppImage it is the AppImage file.
 pub fn current_exe() -> std::io::Result<PathBuf> {
     if let Some(p) = RENAMED_EXE.lock().ok().and_then(|g| g.clone()) {
+        return Ok(p);
+    }
+    if let Some(p) = appimage() {
         return Ok(p);
     }
     std::env::current_exe()
@@ -307,12 +375,13 @@ fn renamed_for_version(exe: &Path, version: &str) -> Option<PathBuf> {
     (is_release_file_name(name) && !name.eq_ignore_ascii_case(&wanted)).then(|| exe.with_file_name(wanted))
 }
 
-/// `Diskie-<version>-windows-x64.exe`, any version, any case.
+/// This platform's release file name (`Diskie-<version>-windows-x64.exe`), any version, any case.
 fn is_release_file_name(name: &str) -> bool {
+    let Some((_, suffix)) = ASSET_NAMES.iter().find(|(p, _)| *p == platform()) else { return false };
     let lower = name.to_ascii_lowercase();
     lower
         .strip_prefix("diskie-")
-        .and_then(|rest| rest.strip_suffix("-windows-x64.exe"))
+        .and_then(|rest| rest.strip_suffix(&suffix.to_ascii_lowercase()))
         .is_some_and(|v| semver::Version::parse(v).is_ok())
 }
 
@@ -343,7 +412,7 @@ pub fn on_startup(current: &str) -> Startup {
         && let Ok(exe) = current_exe()
     {
         let old = backup_path(&exe);
-        if old.exists() && self_replace::self_replace(&old).is_ok() {
+        if old.exists() && replace_exe(&exe, &old).is_ok() {
             let _ = std::fs::remove_file(&old);
             let _ = std::fs::remove_file(&path);
             let exe = rename_for_version(&exe, &s.from);
@@ -361,15 +430,21 @@ pub fn on_startup(current: &str) -> Startup {
     Startup::Updated { from: s.from }
 }
 
-/// Call once the app has been running normally for a little while after an update.
-pub fn confirm_healthy() {
-    if let Some(path) = state_path()
-        && path.exists()
-    {
-        let _ = std::fs::remove_file(path);
-        if let Ok(exe) = current_exe() {
-            let _ = std::fs::remove_file(backup_path(&exe));
-        }
+/// Call once the app has been running normally for a little while, with this build's version.
+/// If this is the first run of an update, its rollback state and the old copy are no longer needed.
+///
+/// Only an update *to* `current` is confirmed: a copy that has just installed an update itself
+/// (still running the old version) must leave the new version's state alone, or the new version
+/// could no longer be rolled back.
+pub fn confirm_healthy(current: &str) {
+    let Some(path) = state_path() else { return };
+    let Some(s) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<PendingState>(&b).ok()) else { return };
+    if s.to != current {
+        return;
+    }
+    let _ = std::fs::remove_file(path);
+    if let Ok(exe) = current_exe() {
+        let _ = std::fs::remove_file(backup_path(&exe));
     }
 }
 
@@ -434,6 +509,36 @@ mod tests {
         assert!(matches!(r, Err(Error::Verification(_))), "a garbage signature must not verify");
     }
 
+    #[test]
+    fn every_platform_has_its_own_file_name() {
+        assert_eq!(asset_file_name("windows-x86_64", "0.2.0").unwrap(), "Diskie-0.2.0-windows-x64.exe");
+        assert_eq!(asset_file_name("linux-x86_64", "0.2.0").unwrap(), "Diskie-0.2.0-linux-x64");
+        assert_eq!(asset_file_name("linux-x86_64-appimage", "0.2.0").unwrap(), "Diskie-0.2.0-x86_64.AppImage");
+        assert_eq!(asset_file_name("plan9", "0.2.0"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_keeps_the_file_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("diskie-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("diskie");
+        std::fs::write(&exe, b"old").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Downloads land in /tmp with ordinary file permissions.
+        let new = dir.join("download");
+        std::fs::write(&new, b"new").unwrap();
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o600)).unwrap();
+        replace_exe(&exe, &new).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temporary file is left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
     #[test]
     fn only_the_release_name_is_renamed() {
         let dir = Path::new("downloads");

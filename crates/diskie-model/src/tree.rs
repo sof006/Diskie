@@ -25,6 +25,8 @@ pub mod flag {
     pub const REPARSE: u8 = 8;
     /// Not a real file system entry, such as the NTFS metadata total.
     pub const SYNTHETIC: u8 = 16;
+    /// A folder where another file system is mounted (Linux). Not entered, so it counts as empty.
+    pub const MOUNT: u8 = 32;
 }
 
 #[derive(Clone, Copy)]

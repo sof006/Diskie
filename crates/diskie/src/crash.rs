@@ -71,6 +71,7 @@ fn message(payload: &(dyn std::any::Any + Send)) -> String {
 static TOLD: AtomicBool = AtomicBool::new(false);
 
 /// Appends one report to the log and, the first time, tells the user.
+#[cfg(windows)]
 fn record(report: &str) {
     write_log(report);
     tell_once();

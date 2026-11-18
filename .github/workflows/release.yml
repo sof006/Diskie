@@ -1,8 +1,9 @@
 # Publishes a release when a version tag (v1.2.3) is pushed.
 #
-# The executable is signed with the project's minisign key, held in the DISKIE_SIGNING_KEY
-# secret (the contents of diskie-release.key). Diskie verifies that signature against the
-# public key in keys/diskie-release.pub before it installs any update.
+# Each platform is built and tested on its own runner; the publish job then signs every download
+# with the project's minisign key, held in the DISKIE_SIGNING_KEY secret (the contents of
+# diskie-release.key). Diskie verifies that signature against the public key in
+# keys/diskie-release.pub before it installs any update.
 name: Release
 
 on:
@@ -23,8 +24,47 @@ jobs:
         run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
       - name: Build
         run: cargo build --profile dist -p diskie
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/dist/Diskie.exe
+          if-no-files-found: error
+
+  linux:
+    # The oldest supported Ubuntu, so the binary runs on older glibc too.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: sudo sh packaging/linux/build-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
+      - name: Build
+        run: cargo build --profile dist -p diskie
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          bash packaging/linux/package.sh "$version" target/dist/Diskie linux
+          cp target/dist/Diskie linux/diskie
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: linux/
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: built
       - name: Sign and write latest.json
-        shell: bash
         env:
           DISKIE_SIGNING_KEY: ${{ secrets.DISKIE_SIGNING_KEY }}
         run: |
@@ -32,9 +72,12 @@ jobs:
           notes="docs/releases/${version}.md"
           [ -f "$notes" ] || { echo "missing $notes"; exit 1; }
           export DISKIE_RELEASE_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cargo xtask release "$version" target/dist/Diskie.exe dist "$notes"
+          cargo xtask release "$version" dist "$notes" \
+            windows-x86_64=built/windows/Diskie.exe \
+            linux-x86_64=built/linux/diskie \
+            linux-x86_64-appimage=built/linux/Diskie-x86_64.AppImage \
+            extra=built/linux/Diskie-${version}-linux-x64.tar.gz
       - name: Publish
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

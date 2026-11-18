@@ -6,11 +6,16 @@
 
 mod app;
 mod crash;
+mod frame;
 mod elevate;
 mod icons;
 mod settings;
 mod theme;
 mod treemap_view;
+mod words;
+
+/// The Linux desktop entry and Wayland app id.
+pub const APP_ID: &str = "io.github.sof006.Diskie";
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,7 +33,7 @@ fn main() {
     match diskie_update::on_startup(version) {
         diskie_update::Startup::RolledBack { failed, exe } => {
             // The previous version is back in place; start it and step aside.
-            let mut cmd = std::process::Command::new(exe);
+            let mut cmd = diskie_update::restart_command(&exe);
             cmd.arg("--rolled-back").arg(&failed);
             if !diskie_scan::volumes::is_elevated() {
                 cmd.arg(elevate::NO_ELEVATE_ARG);
@@ -49,7 +54,7 @@ fn main() {
                 let failed = it.next().cloned().unwrap_or_default();
                 notice = Some(format!("Diskie {failed} didn't start properly, so the previous version was restored."));
             }
-            a if a.starts_with("--") => {}
+            a if a.starts_with("--") || a.is_empty() => {}
             a => start = Some(PathBuf::from(a)),
         }
     }
@@ -60,7 +65,8 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(820.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some("Diskie".into()), ..Default::default() }),
             window_min_size: Some(size(px(860.), px(520.))),
-            app_id: Some("Diskie".into()),
+            // On Linux this must match the .desktop file's name, so the desktop shows Diskie's icon.
+            app_id: Some(if cfg!(windows) { "Diskie" } else { APP_ID }.into()),
             ..Default::default()
         };
         let start = start.clone();
@@ -71,7 +77,7 @@ fn main() {
         // After an update, once this version has run normally for a while, forget the old copy.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_secs(15)).await;
-            diskie_update::confirm_healthy();
+            diskie_update::confirm_healthy(env!("CARGO_PKG_VERSION"));
         })
         .detach();
     });

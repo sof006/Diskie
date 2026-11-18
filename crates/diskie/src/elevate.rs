@@ -6,6 +6,7 @@
 //! UAC prompt. If that is declined, it simply carries on as a standard user.
 
 /// Passed to the elevated copy so it never asks again.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const ELEVATED_ARG: &str = "--elevated";
 /// Skips the prompt (also the `run_as_admin` setting).
 pub const NO_ELEVATE_ARG: &str = "--no-elevate";

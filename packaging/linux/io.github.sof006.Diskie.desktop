@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Diskie
+GenericName=Disk Usage Analyzer
+Comment=See what is using your disk space
+Exec=diskie %f
+Icon=io.github.sof006.Diskie
+Terminal=false
+Categories=System;Utility;Filesystem;
+Keywords=disk;space;usage;storage;treemap;
+StartupWMClass=io.github.sof006.Diskie
