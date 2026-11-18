@@ -18,6 +18,7 @@ mod owners;
 mod settings;
 mod theme;
 mod treemap_view;
+mod window_icon;
 mod words;
 
 /// The Linux desktop entry and Wayland app id.
@@ -81,6 +82,7 @@ fn main() {
         let start = start.clone();
         let notice = notice.clone();
         gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| app::Diskie::new(start, notice, window, cx))).expect("failed to open the window");
+        window_icon::set();
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
         // After an update, once this version has run normally for a while, forget the old copy.
