@@ -44,6 +44,8 @@ pub struct Built {
 pub struct MapState {
     pub current: Option<Rc<MapLayout>>,
     pub pending: Option<MapKey>,
+    /// A layout whose build panicked, so it isn't retried every frame.
+    pub failed: Option<MapKey>,
     /// Where the treemap was last painted, and at what scale.
     pub bounds: Bounds<Pixels>,
     pub scale: f32,

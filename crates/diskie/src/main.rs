@@ -5,6 +5,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod crash;
 mod elevate;
 mod icons;
 mod settings;
@@ -17,6 +18,7 @@ use std::time::Duration;
 use gpui_kit::*;
 
 fn main() {
+    crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if settings::Settings::load().run_as_admin && elevate::relaunch_elevated(&args) {
         return;

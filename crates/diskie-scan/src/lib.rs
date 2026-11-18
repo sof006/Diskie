@@ -121,6 +121,8 @@ pub enum Error {
     Cancelled,
     /// The root itself could not be listed.
     Root(std::io::Error),
+    /// A bug: the scan panicked. The message is already user-facing.
+    Internal(String),
 }
 
 impl std::fmt::Display for Error {
@@ -128,6 +130,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Cancelled => f.write_str("scan cancelled"),
             Error::Root(e) => write!(f, "cannot read the folder: {e}"),
+            Error::Internal(m) => f.write_str(m),
         }
     }
 }
@@ -144,7 +147,10 @@ pub fn scan(root: &Path, opts: Options, progress: &Progress) -> Result<Scan, Err
     if opts.mft
         && let Some(letter) = volumes::drive_root_letter(&root)
     {
-        if !volumes::is_elevated() {
+        if volumes::is_network_path(&root) {
+            // A mapped network drive can report NTFS, but its MFT is on the server; the walk is
+            // the right method there, so there is nothing to explain.
+        } else if !volumes::is_elevated() {
             fallback = Some("Diskie is not running as administrator".to_string());
         } else if volumes::filesystem(&root).as_deref() != Some("NTFS") {
             fallback = Some("the drive is not NTFS".to_string());

@@ -7,7 +7,7 @@
 //! near where it already is. Junctions and symbolic links are recorded but never followed.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Condvar, Mutex};
 use std::time::UNIX_EPOCH;
 
@@ -28,6 +28,21 @@ struct Queue {
     ready: Condvar,
     /// Jobs queued or being worked on. The walk is finished when this reaches zero.
     pending: AtomicUsize,
+    /// A worker panicked: the others stop instead of waiting for its jobs forever.
+    failed: AtomicBool,
+}
+
+/// Wakes the other workers if this one panics.
+struct WakeOnPanic<'a>(&'a Queue);
+
+impl Drop for WakeOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.failed.store(true, Relaxed);
+            let _guard = self.0.stack.lock();
+            self.0.ready.notify_all();
+        }
+    }
 }
 
 pub fn default_threads(root: &Path) -> usize {
@@ -47,11 +62,12 @@ pub fn scan(root: &Path, threads: usize, progress: &Progress) -> Result<Tree, Er
     std::fs::read_dir(root).map_err(Error::Root)?;
 
     let next_key = AtomicU64::new(ROOT_KEY + 1);
-    let q = Queue { stack: Mutex::new(vec![Job { path: root.to_path_buf(), key: ROOT_KEY }]), ready: Condvar::new(), pending: AtomicUsize::new(1) };
+    let q = Queue { stack: Mutex::new(vec![Job { path: root.to_path_buf(), key: ROOT_KEY }]), ready: Condvar::new(), pending: AtomicUsize::new(1), failed: AtomicBool::new(false) };
 
     let chunks: Vec<Chunk> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads.max(1)).map(|_| s.spawn(|| worker(&q, &next_key, progress))).collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        // A worker that panicked would leave a hole in the tree; pass the panic on instead.
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect()
     });
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
@@ -65,10 +81,14 @@ fn worker(q: &Queue, next_key: &AtomicU64, progress: &Progress) -> Chunk {
     let mut chunk = Chunk::with_capacity(16_384);
     let mut found: Vec<Job> = Vec::new();
     let mut listed = 0u32;
+    let _wake = WakeOnPanic(q);
     loop {
         let job = {
             let mut stack = q.stack.lock().unwrap();
             loop {
+                if q.failed.load(Relaxed) {
+                    break None;
+                }
                 if let Some(j) = stack.pop() {
                     break Some(j);
                 }
@@ -110,6 +130,10 @@ fn worker(q: &Queue, next_key: &AtomicU64, progress: &Progress) -> Chunk {
 }
 
 fn list(job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64, progress: &Progress) {
+    #[cfg(test)]
+    if job.path.file_name().is_some_and(|n| n == tests::PANIC_MARKER) {
+        panic!("test panic in a walk worker");
+    }
     let rd = match std::fs::read_dir(&job.path) {
         Ok(rd) => rd,
         Err(_) => {
@@ -156,4 +180,55 @@ fn list(job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key: &AtomicU64
     progress.files.fetch_add(files, Relaxed);
     progress.dirs.fetch_add(dirs, Relaxed);
     progress.bytes.fetch_add(bytes, Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub const PANIC_MARKER: &str = "diskie-test-panic";
+
+    fn tree_with(dir: &Path, marker: bool) {
+        for a in 0..8 {
+            for b in 0..8 {
+                let d = dir.join(format!("a{a}")).join(format!("b{b}"));
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("f.txt"), b"hello").unwrap();
+            }
+        }
+        if marker {
+            std::fs::create_dir_all(dir.join("a3").join(PANIC_MARKER)).unwrap();
+        }
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("diskie-walk-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn walks_everything() {
+        let d = temp("ok");
+        tree_with(&d, false);
+        let t = scan(&d, 4, &Progress::default()).unwrap();
+        assert_eq!(t.files[0], 64);
+        assert_eq!(t.dirs[0], 72);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_worker_panic_fails_the_scan_instead_of_hanging_it() {
+        let d = temp("panic");
+        tree_with(&d, true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(|| scan(&d2, 4, &Progress::default()));
+            let _ = tx.send(r.is_err());
+        });
+        let panicked = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the scan hung after a worker panicked");
+        assert!(panicked, "the panic should reach the caller");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

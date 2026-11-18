@@ -197,7 +197,7 @@ impl Diskie {
         window.set_window_title(&format!("Scanning {} · Diskie", root.display()));
         let opts = diskie_scan::Options { mft: self.settings.use_mft, threads: None };
         let (p2, r2) = (progress.clone(), root.clone());
-        let job = cx.background_spawn(async move { diskie_scan::scan(&r2, opts, &p2) });
+        let job = cx.background_spawn(async move { crate::crash::guard(|| diskie_scan::scan(&r2, opts, &p2)) });
         let task = cx.spawn_in(window, async move |this, cx| {
             let result = job.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -206,6 +206,7 @@ impl Diskie {
                 if !current {
                     return;
                 }
+                let result = result.unwrap_or_else(|internal| Err(diskie_scan::Error::Internal(internal)));
                 match result {
                     Ok(scan) => {
                         window.set_window_title(&format!("{} · Diskie", root.display()));
@@ -569,7 +570,7 @@ impl Diskie {
         let Some(key) = wanted else { return };
         {
             let m = self.map.borrow();
-            if m.current.as_ref().is_some_and(|c| c.key == key) || m.pending == Some(key) {
+            if m.current.as_ref().is_some_and(|c| c.key == key) || m.pending == Some(key) || m.failed == Some(key) {
                 return;
             }
             if m.pending.is_some() {
@@ -578,12 +579,19 @@ impl Diskie {
         }
         self.map.borrow_mut().pending = Some(key);
         let (tree, palette) = (l.tree.clone(), self.theme.palette());
-        let job = cx.background_spawn(async move { treemap_view::build(tree, key, palette) });
+        let job = cx.background_spawn(async move { crate::crash::guard(|| treemap_view::build(tree, key, palette)) });
         self.map_job = Some(cx.spawn(async move |this, cx| {
             let built = job.await;
             let _ = this.update(cx, |this, cx| {
                 let mut m = this.map.borrow_mut();
-                m.install(built);
+                match built {
+                    Ok(built) => m.install(built),
+                    Err(e) => {
+                        // Don't ask for the same layout again on the next frame.
+                        m.failed = Some(key);
+                        this.notice = Some((format!("Couldn't draw the treemap. {e}"), true));
+                    }
+                }
                 m.pending = None;
                 drop(m);
                 cx.notify();

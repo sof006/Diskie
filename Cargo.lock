@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "diskie"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "diskie-model",
  "diskie-scan",
@@ -1356,11 +1356,11 @@ dependencies = [
 
 [[package]]
 name = "diskie-model"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "diskie-scan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "diskie-model",
  "ntfs-reader",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "diskie-update"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "minisign",
  "minisign-verify",
@@ -8455,7 +8455,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "diskie-update",
  "minisign",

@@ -22,9 +22,14 @@ pub enum VolumeKind {
     Other,
 }
 
+/// A `\\server\share` path, or a path on a mapped network drive letter.
 pub fn is_network_path(p: &Path) -> bool {
     let s = p.to_string_lossy();
-    s.starts_with(r"\\") && !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\")
+    if s.starts_with(r"\\") {
+        return !s.starts_with(r"\\?\") && !s.starts_with(r"\\.\");
+    }
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && imp::drive_is_remote(b[0] as char)
 }
 
 /// `Some('C')` when `p` is exactly a drive root such as `C:\`.
@@ -102,6 +107,11 @@ mod imp {
             out.push(Volume { root, label: from_wide(&label), filesystem: from_wide(&fs), total, free, kind });
         }
         out
+    }
+
+    pub fn drive_is_remote(letter: char) -> bool {
+        let root = wide(&format!("{letter}:\\"));
+        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
     }
 
     pub fn filesystem(root: &Path) -> Option<String> {
@@ -203,6 +213,10 @@ mod imp {
 
     pub fn list_volumes() -> Vec<Volume> {
         vec![Volume { root: "/".into(), label: "File system".into(), filesystem: String::new(), total: 0, free: 0, kind: VolumeKind::Fixed }]
+    }
+
+    pub fn drive_is_remote(_: char) -> bool {
+        false
     }
 
     pub fn filesystem(_: &Path) -> Option<String> {
