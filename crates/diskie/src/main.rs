@@ -26,9 +26,9 @@ fn main() {
     let version = env!("CARGO_PKG_VERSION");
     let mut notice = None;
     match diskie_update::on_startup(version) {
-        diskie_update::Startup::RolledBack { failed } => {
+        diskie_update::Startup::RolledBack { failed, exe } => {
             // The previous version is back in place; start it and step aside.
-            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap_or_default());
+            let mut cmd = std::process::Command::new(exe);
             cmd.arg("--rolled-back").arg(&failed);
             if !diskie_scan::volumes::is_elevated() {
                 cmd.arg(elevate::NO_ELEVATE_ARG);

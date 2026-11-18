@@ -120,7 +120,8 @@ enum UpdateState {
     UpToDate,
     Available(diskie_update::Update),
     Downloading { version: String, done: u64, total: u64 },
-    Installed { version: String },
+    /// `exe` is where the new version now lives (renamed when it carried the old version's name).
+    Installed { version: String, exe: PathBuf },
     Failed(String),
 }
 
@@ -534,7 +535,7 @@ impl Diskie {
             let r = job.await;
             let _ = this.update(cx, |this, cx| {
                 this.update = match r {
-                    Ok(()) => UpdateState::Installed { version },
+                    Ok(exe) => UpdateState::Installed { version, exe },
                     Err(e) => UpdateState::Failed(e.to_string()),
                 };
                 cx.notify();
@@ -545,7 +546,13 @@ impl Diskie {
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
-        if let Ok(exe) = std::env::current_exe() {
+        // After an update, start the file where the new version now is: Windows keeps reporting
+        // this process's original path even if the update renamed the file.
+        let exe = match &self.update {
+            UpdateState::Installed { exe, .. } => Ok(exe.clone()),
+            _ => diskie_update::current_exe(),
+        };
+        if let Ok(exe) = exe {
             let mut cmd = std::process::Command::new(exe);
             // Restart with the same rights: an elevated copy starts elevated, and a standard-user
             // copy (prompt declined, or turned off) doesn't ask again.
@@ -1248,8 +1255,15 @@ impl Diskie {
             UpdateState::Downloading { version, done, total } => {
                 (format!("Downloading {version}… {}%", if *total > 0 { done * 100 / total } else { 0 }), None, false)
             }
-            UpdateState::Installed { version } => (format!("{version} installed · Restart"), Some(2), true),
+            UpdateState::Installed { version, .. } => (format!("{version} installed · Restart"), Some(2), true),
             UpdateState::Failed(e) => (format!("Update failed: {e}"), Some(0), false),
+        };
+        let update_tip: Option<SharedString> = match (&self.update, update_action) {
+            (UpdateState::Failed(e), _) => Some(format!("{e}. Click to try again.").into()),
+            (_, Some(0)) => Some("Check for updates".into()),
+            (UpdateState::Available(_), _) => Some("Download, verify and install the update".into()),
+            (_, Some(2)) => Some("Restart Diskie to finish updating".into()),
+            _ => None,
         };
         div()
             .h(px(STATUS_H))
@@ -1276,6 +1290,7 @@ impl Diskie {
                     .when(emphasized, |d| d.text_color(rgb(t.accent)).font_weight(FontWeight::SEMIBOLD))
                     .when(update_action.is_some(), |d| d.cursor_pointer().hover(|s| s.bg(rgba(t.hover))))
                     .child(update_text)
+                    .when_some(update_tip, |d, tip| d.tooltip(move |_, cx| cx.new(|_| Tip { text: tip.clone(), theme: t }).into()))
                     .on_click(cx.listener(move |this, _, _, cx| match update_action {
                         Some(0) => this.check_for_updates(true, cx),
                         Some(1) => {
@@ -1287,6 +1302,29 @@ impl Diskie {
                         _ => {}
                     })),
             )
+    }
+}
+
+/// A plain text tooltip in the app's own colours.
+struct Tip {
+    text: SharedString,
+    theme: Theme,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(rgb(t.btn_line))
+            .bg(rgb(t.chrome))
+            .text_color(rgb(t.text))
+            .text_size(px(12.))
+            .shadow_md()
+            .child(self.text.clone())
     }
 }
 

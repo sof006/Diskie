@@ -13,6 +13,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub use semver::Version as SemVer;
 use serde::{Deserialize, Serialize};
@@ -236,7 +237,7 @@ pub fn can_self_update() -> Result<(), Error> {
     if std::env::var_os("DISKIE_NO_SELF_UPDATE").is_some() {
         return Err(Error::Unsupported("updates are managed by the package that installed Diskie"));
     }
-    let exe = std::env::current_exe().map_err(|e| Error::Install(e.to_string()))?;
+    let exe = current_exe().map_err(|e| Error::Install(e.to_string()))?;
     let dir = exe.parent().ok_or(Error::Unsupported("cannot tell where Diskie is installed"))?;
     let probe = dir.join(".diskie-write-test");
     match std::fs::write(&probe, b"") {
@@ -249,9 +250,14 @@ pub fn can_self_update() -> Result<(), Error> {
 }
 
 /// Swaps the verified download in for the running executable. Takes effect on the next start.
-pub fn install(downloaded: &Path, from_version: &str, to_version: &str) -> Result<(), Error> {
+///
+/// Returns the path to start the new version from. That is the same path, unless the file still
+/// had the old release's name (`Diskie-0.1.0-windows-x64.exe`): then it is renamed to match the
+/// new version. Windows keeps reporting a running program's original path, so restart from the
+/// returned path (or [`current_exe`]), not `std::env::current_exe()`.
+pub fn install(downloaded: &Path, from_version: &str, to_version: &str) -> Result<PathBuf, Error> {
     can_self_update()?;
-    let exe = std::env::current_exe().map_err(|e| Error::Install(e.to_string()))?;
+    let exe = current_exe().map_err(|e| Error::Install(e.to_string()))?;
     std::fs::copy(&exe, backup_path(&exe)).map_err(|e| Error::Install(format!("keeping the old version: {e}")))?;
     self_replace::self_replace(downloaded).map_err(|e| Error::Install(e.to_string()))?;
     let _ = std::fs::remove_file(downloaded);
@@ -260,15 +266,63 @@ pub fn install(downloaded: &Path, from_version: &str, to_version: &str) -> Resul
         let s = PendingState { from: from_version.into(), to: to_version.into(), starts: 0 };
         let _ = std::fs::write(p, serde_json::to_vec(&s).unwrap_or_default());
     }
-    Ok(())
+    Ok(rename_for_version(&exe, to_version))
+}
+
+/// The file name a version is published under: `Diskie-0.1.1-windows-x64.exe`.
+pub fn release_file_name(version: &str) -> String {
+    format!("Diskie-{version}-windows-x64.exe")
+}
+
+/// Set when Diskie renames its own executable while running.
+static RENAMED_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Where this executable is now. Like `std::env::current_exe()`, but it follows a rename Diskie
+/// made itself: Windows keeps reporting the path a program was started from.
+pub fn current_exe() -> std::io::Result<PathBuf> {
+    if let Some(p) = RENAMED_EXE.lock().ok().and_then(|g| g.clone()) {
+        return Ok(p);
+    }
+    std::env::current_exe()
+}
+
+/// Renames the running executable `exe` to `version`'s release file name, if it carries some
+/// release's file name now (`Diskie-0.1.0-windows-x64.exe`). Leaves any other name alone (a copy
+/// renamed to `Diskie.exe` stays that way), and never replaces a file already using the new name.
+/// Returns the path the executable now has.
+fn rename_for_version(exe: &Path, version: &str) -> PathBuf {
+    let Some(new) = renamed_for_version(exe, version) else { return exe.to_path_buf() };
+    if new.exists() || std::fs::rename(exe, &new).is_err() {
+        return exe.to_path_buf();
+    }
+    if let Ok(mut g) = RENAMED_EXE.lock() {
+        *g = Some(new.clone());
+    }
+    new
+}
+
+fn renamed_for_version(exe: &Path, version: &str) -> Option<PathBuf> {
+    let name = exe.file_name()?.to_str()?;
+    let wanted = release_file_name(version);
+    (is_release_file_name(name) && !name.eq_ignore_ascii_case(&wanted)).then(|| exe.with_file_name(wanted))
+}
+
+/// `Diskie-<version>-windows-x64.exe`, any version, any case.
+fn is_release_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .strip_prefix("diskie-")
+        .and_then(|rest| rest.strip_suffix("-windows-x64.exe"))
+        .is_some_and(|v| semver::Version::parse(v).is_ok())
 }
 
 pub enum Startup {
     Normal,
     /// The first start after an update.
     Updated { from: String },
-    /// The update failed to start twice; the previous version was put back and should be started.
-    RolledBack { failed: String },
+    /// The update failed to start twice; the previous version was put back and should be started
+    /// from `exe` (renamed back when the update had renamed it).
+    RolledBack { failed: String, exe: PathBuf },
 }
 
 /// Call first thing at startup with this build's version.
@@ -286,16 +340,24 @@ pub fn on_startup(current: &str) -> Startup {
     }
     s.starts += 1;
     if s.starts > 2
-        && let Ok(exe) = std::env::current_exe()
+        && let Ok(exe) = current_exe()
     {
         let old = backup_path(&exe);
         if old.exists() && self_replace::self_replace(&old).is_ok() {
             let _ = std::fs::remove_file(&old);
             let _ = std::fs::remove_file(&path);
-            return Startup::RolledBack { failed: s.to };
+            let exe = rename_for_version(&exe, &s.from);
+            return Startup::RolledBack { failed: s.to, exe };
         }
     }
     let _ = std::fs::write(&path, serde_json::to_vec(&s).unwrap_or_default());
+    // Versions before 0.1.2 didn't rename the file when they installed an update, so it can still
+    // carry an older release's name. Put that right now (the restarted copy is this version).
+    if s.starts == 1
+        && let Ok(exe) = current_exe()
+    {
+        rename_for_version(&exe, current);
+    }
     Startup::Updated { from: s.from }
 }
 
@@ -305,7 +367,7 @@ pub fn confirm_healthy() {
         && path.exists()
     {
         let _ = std::fs::remove_file(path);
-        if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = current_exe() {
             let _ = std::fs::remove_file(backup_path(&exe));
         }
     }
@@ -370,5 +432,39 @@ mod tests {
         assert!(matches!(r, Err(Error::Verification(_))));
         let r = verify_with_key(data, &a, &semver::Version::new(0, 2, 0), TEST_PK);
         assert!(matches!(r, Err(Error::Verification(_))), "a garbage signature must not verify");
+    }
+
+    #[test]
+    fn only_the_release_name_is_renamed() {
+        let dir = Path::new("downloads");
+        let renamed = |name: &str| renamed_for_version(&dir.join(name), "0.1.2");
+        let new = Some(dir.join("Diskie-0.1.2-windows-x64.exe"));
+        assert_eq!(renamed("Diskie-0.1.1-windows-x64.exe"), new);
+        // An older name that an update before 0.1.2 left alone.
+        assert_eq!(renamed("Diskie-0.1.0-windows-x64.exe"), new);
+        assert_eq!(renamed("diskie-0.1.0-WINDOWS-x64.EXE"), new);
+        assert_eq!(renamed("Diskie-0.1.2-windows-x64.exe"), None);
+        assert_eq!(renamed("Diskie.exe"), None);
+        assert_eq!(renamed("Diskie-latest-windows-x64.exe"), None);
+        assert_eq!(renamed("Diskie-0.1.0-windows-x64 (1).exe"), None);
+    }
+
+    #[test]
+    fn renaming_never_replaces_another_file() {
+        let dir = std::env::temp_dir().join(format!("diskie-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(release_file_name("0.1.0"));
+        std::fs::write(&old, b"new build").unwrap();
+        assert_eq!(rename_for_version(&old, "0.1.1"), dir.join(release_file_name("0.1.1")));
+        assert!(!old.exists());
+
+        // A manual download of 0.1.2 already sits there: keep it, and keep this file's name.
+        let current = dir.join(release_file_name("0.1.1"));
+        let other = dir.join(release_file_name("0.1.2"));
+        std::fs::write(&other, b"someone else's file").unwrap();
+        assert_eq!(rename_for_version(&current, "0.1.2"), current);
+        assert_eq!(std::fs::read(&other).unwrap(), b"someone else's file");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -70,7 +70,7 @@ fn release(version: &str, exe: &Path, out: &Path, notes: Option<PathBuf>) -> Res
         return Err(format!("tag says {version} but the workspace version is {workspace_version}"));
     }
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    let name = format!("Diskie-{version}-windows-x64.exe");
+    let name = diskie_update::release_file_name(version);
     let data = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     std::fs::write(out.join(&name), &data).map_err(|e| e.to_string())?;
 
