@@ -15,6 +15,8 @@ use crate::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapKey {
+    /// Which scan the layout is for. Node numbers only mean something within one scan's tree.
+    pub scan: u64,
     pub zoom: u32,
     pub w: u32,
     pub h: u32,
@@ -55,12 +57,13 @@ pub struct MapState {
 
 impl MapState {
     /// The layout the current bounds call for, if the pane has been painted yet.
-    pub fn wanted(&self, zoom: u32, generation: u64, dark: bool) -> Option<MapKey> {
+    pub fn wanted(&self, scan: u64, zoom: u32, generation: u64, dark: bool) -> Option<MapKey> {
         let (w, h) = (self.bounds.size.width.as_f32(), self.bounds.size.height.as_f32());
         if w < 8.0 || h < 8.0 || self.scale <= 0.0 {
             return None;
         }
         Some(MapKey {
+            scan,
             zoom,
             w: w.round() as u32,
             h: h.round() as u32,
@@ -83,9 +86,19 @@ impl MapState {
         }
     }
 
-    /// Converts a window position to layout coordinates and finds the innermost rectangle.
-    pub fn hit(&self, pos: Point<Pixels>) -> Option<u32> {
-        let l = self.current.as_ref()?;
+    /// Drops the layout of a previous scan, so it is never drawn or hit-tested against a new tree.
+    pub fn forget(&mut self) {
+        if let Some(old) = self.current.take() {
+            self.stale.push(old.image.clone());
+        }
+        self.pending = None;
+        self.failed = None;
+    }
+
+    /// Converts a window position to layout coordinates and finds the innermost rectangle of
+    /// `scan`'s layout.
+    pub fn hit(&self, pos: Point<Pixels>, scan: u64) -> Option<u32> {
+        let l = self.current.as_ref().filter(|l| l.key.scan == scan)?;
         let b = self.bounds;
         let (bw, bh) = (b.size.width.as_f32(), b.size.height.as_f32());
         if bw <= 0.0 || bh <= 0.0 {
@@ -111,6 +124,8 @@ pub fn build(tree: Arc<Tree>, key: MapKey, palette: Palette) -> Built {
 
 pub struct Paint {
     pub tree: Arc<Tree>,
+    /// The scan `tree` came from: a layout for any other scan is not drawn.
+    pub scan: u64,
     pub theme: Theme,
     pub hovered: Option<u32>,
     pub selected: Option<u32>,
@@ -137,7 +152,7 @@ pub fn element(state: Rc<RefCell<MapState>>, p: Paint) -> impl IntoElement {
             }
             let t = &p.theme;
             window.paint_quad(fill(bounds, rgb(t.map_bg)));
-            let Some(l) = s.current.clone() else { return };
+            let Some(l) = s.current.clone().filter(|l| l.key.scan == p.scan) else { return };
             drop(s);
             let _ = window.paint_image(bounds, bounds, Corners::default(), l.image.clone(), 0, false);
 
@@ -212,4 +227,42 @@ fn label(window: &mut Window, cx: &mut App, font: &Font, text: &str, color: Rgba
     let run = TextRun { len: text.len(), font: font.clone(), color: color.into(), background_color: None, underline: None, strikethrough: None };
     let line = window.text_system().shape_line(text.into(), px(11.), &[run], None);
     let _ = line.paint(point(px(x), px(y)), px(14.), TextAlign::Left, None, window, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diskie_model::{Chunk, NO_KEY};
+
+    fn tree(files: u64) -> Arc<Tree> {
+        let mut c = Chunk::default();
+        for i in 0..files {
+            c.push(NO_KEY, 0, &format!("f{i}.bin"), 1000 + i, 0, 0);
+        }
+        Arc::new(Tree::build("root", 0, vec![c], 1))
+    }
+
+    fn state() -> MapState {
+        MapState { bounds: Bounds::new(point(px(0.), px(0.)), size(px(400.), px(300.))), scale: 1.0, ..Default::default() }
+    }
+
+    /// A bigger scan's layout once outlived it: the next scan asked for an identical key, so the
+    /// old rectangles were drawn against the new, smaller tree and indexed past its end.
+    #[::core::prelude::v1::test]
+    fn a_layout_never_carries_over_to_another_scan() {
+        let pal = Theme::DARK.palette();
+        let mut s = state();
+        let big = s.wanted(1, Tree::ROOT, 0, true).unwrap();
+        s.install(build(tree(5000), big, pal));
+        let centre = point(px(200.), px(150.));
+        assert!(s.hit(centre, 1).is_some_and(|n| n >= 1000), "the first scan's layout covers its big nodes");
+
+        // The next scan: same pane, same zoom, same generation, different tree.
+        let next = s.wanted(2, Tree::ROOT, 0, true).unwrap();
+        assert_ne!(next, big, "the old layout must not count as up to date");
+        assert_eq!(s.hit(centre, 2), None, "the old layout must not be hit-tested for the new scan");
+        s.forget();
+        assert!(s.current.is_none());
+        assert_eq!(s.stale.len(), 1, "its image is released from the GPU on the next paint");
+    }
 }

@@ -105,12 +105,24 @@ fn write_log(report: &str) {
     }
 }
 
+/// Shows the message from its own thread and waits for it to be dismissed. A message box runs a
+/// message loop on the thread that shows it; on the main thread that would hand Diskie's own
+/// window messages back to the UI that just failed, which fails again and ends the process
+/// before the message can be read.
 #[cfg(windows)]
 fn tell(text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW};
-    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let (text, title) = (wide(text), wide("Diskie"));
-    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW};
+    let text = text.to_string();
+    let shown = std::thread::Builder::new().name("crash message".into()).spawn(move || {
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        let (text, title) = (wide(&text), wide("Diskie"));
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST)
+        };
+    });
+    if let Ok(handle) = shown {
+        let _ = handle.join();
+    }
 }
 
 #[cfg(not(windows))]

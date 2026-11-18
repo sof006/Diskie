@@ -38,8 +38,16 @@ pub struct Loaded {
     selected: Option<u32>,
     hovered: Option<u32>,
     zoom: u32,
+    /// Unique to this scan (never reused), so a treemap laid out for another scan's tree is
+    /// never mistaken for this one's.
+    scan: u64,
     generation: u64,
     kind_totals: Option<(u32, u64, [u64; KIND_COUNT])>,
+}
+
+fn next_scan_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Relaxed)
 }
 
 impl Loaded {
@@ -60,6 +68,7 @@ impl Loaded {
             selected: Some(Tree::ROOT),
             hovered: None,
             zoom: Tree::ROOT,
+            scan: next_scan_id(),
             generation: 0,
             kind_totals: None,
         };
@@ -214,7 +223,7 @@ impl Diskie {
                         this.loaded = Some(Loaded::new(scan, root.clone()));
                         this.scan = ScanState::Idle;
                         this.list.scroll_to_item(0, ScrollStrategy::Top);
-                        this.map.borrow_mut().pending = None;
+                        this.map.borrow_mut().forget();
                         this.volumes = volumes::list_volumes();
                     }
                     Err(diskie_scan::Error::Cancelled) => {
@@ -573,7 +582,7 @@ impl Diskie {
 
     fn schedule_map(&mut self, cx: &mut Context<Self>) {
         let Some(l) = &self.loaded else { return };
-        let wanted = self.map.borrow().wanted(l.zoom, l.generation, self.theme.dark);
+        let wanted = self.map.borrow().wanted(l.scan, l.zoom, l.generation, self.theme.dark);
         let Some(key) = wanted else { return };
         {
             let m = self.map.borrow();
@@ -591,7 +600,10 @@ impl Diskie {
             let built = job.await;
             let _ = this.update(cx, |this, cx| {
                 let mut m = this.map.borrow_mut();
+                let scan = this.loaded.as_ref().map(|l| l.scan);
                 match built {
+                    // A layout for a scan that has since been replaced is thrown away.
+                    Ok(_) if Some(key.scan) != scan => {}
                     Ok(built) => m.install(built),
                     Err(e) => {
                         // Don't ask for the same layout again on the next frame.
@@ -1016,7 +1028,7 @@ impl Diskie {
             }
             s
         };
-        let paint = Paint { tree: l.tree.clone(), theme: t, hovered: l.hovered, selected: l.selected };
+        let paint = Paint { tree: l.tree.clone(), scan: l.scan, theme: t, hovered: l.hovered, selected: l.selected };
         div()
             .size_full()
             .flex()
@@ -1045,7 +1057,7 @@ impl Diskie {
                         if this.dragging_split {
                             return;
                         }
-                        let hit = this.map.borrow().hit(ev.position);
+                        let hit = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan));
                         if let Some(l) = this.loaded.as_mut()
                             && l.hovered != hit
                         {
@@ -1062,7 +1074,7 @@ impl Diskie {
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                         this.focus.focus(window, cx);
                         this.menu = None;
-                        let Some(n) = this.map.borrow().hit(ev.position) else { return };
+                        let Some(n) = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan)) else { return };
                         if ev.click_count >= 2 {
                             this.zoom_to(n, cx);
                         } else {
@@ -1070,7 +1082,7 @@ impl Diskie {
                         }
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                        let Some(n) = this.map.borrow().hit(ev.position) else { return };
+                        let Some(n) = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan)) else { return };
                         this.select(n, true, cx);
                         this.menu = Some(Menu { at: ev.position, node: n });
                         cx.notify();

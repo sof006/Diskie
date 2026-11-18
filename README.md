@@ -2,7 +2,7 @@
 
 A fast disk space analyzer written entirely in Rust, in the same space as TreeSize and WizTree.
 
-> **Status: 0.1.2 preview.** Scanning, the linked tree and treemap, file types, Recycle Bin clean-up and self-updates work on Windows. Reports, snapshots, search and Linux builds are still to come. The design and roadmap are in [PLAN.md](PLAN.md); the framework choice is explained in [spikes/RESULTS.md](spikes/RESULTS.md).
+> **Status: 0.1.3 preview.** Scanning, the linked tree and treemap, file types, Recycle Bin clean-up and self-updates work on Windows. Reports, snapshots, search and Linux builds are still to come. The design and roadmap are in [PLAN.md](PLAN.md); the framework choice is explained in [spikes/RESULTS.md](spikes/RESULTS.md).
 
 ## Download
 
