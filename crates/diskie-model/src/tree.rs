@@ -8,6 +8,8 @@
 //!
 //! About 50 bytes per node plus the name, so ten million files fit in roughly 650 MB.
 
+use std::io::Read;
+
 use crate::kind::{KIND_COUNT, Kind};
 
 /// "No node": the root's parent, and the parent of entries whose parent was never seen.
@@ -27,6 +29,12 @@ pub mod flag {
     pub const SYNTHETIC: u8 = 16;
     /// A folder where another file system is mounted (Linux). Not entered, so it counts as empty.
     pub const MOUNT: u8 = 32;
+    /// A cloud file that is online only (OneDrive, Dropbox): it takes no space on this disk, so
+    /// its size counts as 0. Its size in the cloud is in [`Tree::online_size`].
+    pub const CLOUD: u8 = 64;
+    /// A file or folder kept in sync with the cloud and stored on this disk, so its space can be
+    /// freed by making it online only.
+    pub const SYNCED: u8 = 128;
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +106,8 @@ pub struct Tree {
     pub depth: Vec<u16>,
     /// Number of folders flagged [`flag::UNREADABLE`].
     pub unreadable: u32,
+    /// Size in the cloud of each [`flag::CLOUD`] file, whose own size is 0.
+    online: std::collections::HashMap<u32, u64>,
 }
 
 impl Tree {
@@ -124,6 +134,7 @@ impl Tree {
             kind: vec![Kind::Other as u8; total],
             depth: vec![0; total],
             unreadable: 0,
+            online: Default::default(),
         };
 
         // Indices and names. Root first.
@@ -146,7 +157,13 @@ impl Tree {
                 let idx = t.name_off.len() as u32;
                 t.name_off.push(base + e.name_off);
                 t.name_len.push(e.name_len);
-                t.size.push(e.size);
+                if e.flags & flag::CLOUD != 0 {
+                    // Online only: no space here, but remember how big it is in the cloud.
+                    t.online.insert(idx, e.size);
+                    t.size.push(0);
+                } else {
+                    t.size.push(e.size);
+                }
                 t.mtime.push(e.mtime);
                 t.flags.push(e.flags);
                 parent_keys.push(if e.parent == e.key { NO_KEY } else { e.parent });
@@ -387,15 +404,296 @@ impl Tree {
         }
     }
 
-    /// Moves `child` to its place in `parent`'s size-sorted children after its size dropped.
+    /// Moves `child` to its place in `parent`'s size-sorted children after its size changed.
     fn resort_child(&mut self, parent: u32, child: u32) {
         let (s, c) = (self.child_start[parent as usize] as usize, self.child_count[parent as usize] as usize);
         let Some(mut pos) = self.children[s..s + c].iter().position(|&k| k == child) else { return };
-        while pos + 1 < c && self.size[self.children[s + pos + 1] as usize] > self.size[child as usize] {
+        let size = self.size[child as usize];
+        while pos + 1 < c && self.size[self.children[s + pos + 1] as usize] > size {
             self.children.swap(s + pos, s + pos + 1);
             pos += 1;
         }
+        while pos > 0 && self.size[self.children[s + pos - 1] as usize] < size {
+            self.children.swap(s + pos, s + pos - 1);
+            pos -= 1;
+        }
     }
+
+    /// Size in the cloud of an online-only file ([`flag::CLOUD`]), or 0.
+    pub fn online_size(&self, n: u32) -> u64 {
+        self.online.get(&n).copied().unwrap_or(0)
+    }
+
+    /// Bytes of online-only files at or below `n`: what they would take if downloaded.
+    pub fn online_total(&self, n: u32) -> u64 {
+        if self.online.is_empty() {
+            return 0;
+        }
+        if self.online.len() < 4096 {
+            return self.online.iter().filter(|&(&k, _)| !self.has(k, flag::DELETED) && self.is_ancestor(n, k)).map(|(_, v)| v).sum();
+        }
+        self.subtree(n).map(|x| self.online_size(x)).sum()
+    }
+
+    /// The child of `parent` called `name`, if it is still there.
+    pub fn child_named(&self, parent: u32, name: &str) -> Option<u32> {
+        let fold = self.case_insensitive();
+        self.kids(parent).iter().copied().find(|&k| if fold { self.name(k).eq_ignore_ascii_case(name) } else { self.name(k) == name })
+    }
+
+    /// Windows file systems ignore case (for the ASCII letters that matter here); Linux ones don't.
+    fn case_insensitive(&self) -> bool {
+        let root = self.name(Tree::ROOT);
+        root.contains('\\') || root.as_bytes().get(1) == Some(&b':')
+    }
+
+    /// The node at `path`, which must be at or below the root.
+    pub fn find_path(&self, path: &str) -> Option<u32> {
+        let root = self.name(Tree::ROOT);
+        let fold = self.case_insensitive();
+        let prefix = path.get(..root.len())?;
+        let same = if fold { prefix.eq_ignore_ascii_case(root) } else { prefix == root };
+        if !same {
+            return None;
+        }
+        let rest = &path[root.len()..];
+        if !rest.is_empty() && !rest.starts_with(['\\', '/']) && !root.ends_with(['\\', '/']) {
+            return None;
+        }
+        let mut n = Tree::ROOT;
+        for part in rest.split(['\\', '/']).filter(|p| !p.is_empty()) {
+            n = self.child_named(n, part)?;
+        }
+        Some(n)
+    }
+
+    /// Adds a new entry under `parent` (a file system change seen after the scan) and returns
+    /// it. Its size counts towards every folder above it. Node numbers already handed out stay
+    /// valid.
+    pub fn add(&mut self, parent: u32, name: &str, size: u64, mtime: u32, flags: u8) -> u32 {
+        let n = self.parent.len() as u32;
+        self.name_off.push(self.names.len() as u32);
+        self.name_len.push(name.len() as u32);
+        self.names.extend_from_slice(name.as_bytes());
+        let is_dir = flags & flag::DIR != 0;
+        let size = if flags & flag::CLOUD != 0 {
+            self.online.insert(n, size);
+            0
+        } else {
+            size
+        };
+        self.parent.push(parent);
+        self.child_start.push(self.children.len() as u32);
+        self.child_count.push(0);
+        self.size.push(size);
+        self.files.push(!is_dir as u32);
+        self.dirs.push(0);
+        self.mtime.push(mtime);
+        self.flags.push(flags);
+        self.kind.push(if is_dir { Kind::Other as u8 } else { Kind::of_name(name) as u8 });
+        self.depth.push(self.depth[parent as usize].saturating_add(1));
+
+        // Give the parent room at the end of the children list unless its slice is already last.
+        let (s, c) = (self.child_start[parent as usize] as usize, self.child_count[parent as usize] as usize);
+        if s + c != self.children.len() {
+            let start = self.children.len();
+            self.children.extend_from_within(s..s + c);
+            self.child_start[parent as usize] = start as u32;
+        }
+        self.children.push(n);
+        self.child_count[parent as usize] += 1;
+        self.resort_child(parent, n);
+        self.grow(parent, size as i64, !is_dir as i64, is_dir as i64, mtime);
+        n
+    }
+
+    /// Updates a file's size, modification time and cloud state ([`flag::CLOUD`],
+    /// [`flag::SYNCED`] or 0) after it changed on disk.
+    pub fn set_file(&mut self, n: u32, size: u64, mtime: u32, cloud: u8) {
+        let i = n as usize;
+        if self.is_dir(n) || self.has(n, flag::DELETED) {
+            return;
+        }
+        self.flags[i] = (self.flags[i] & !(flag::CLOUD | flag::SYNCED)) | (cloud & (flag::CLOUD | flag::SYNCED));
+        let size = if self.has(n, flag::CLOUD) {
+            self.online.insert(n, size);
+            0
+        } else {
+            self.online.remove(&n);
+            size
+        };
+        let delta = size as i64 - self.size[i] as i64;
+        self.size[i] = size;
+        self.mtime[i] = mtime;
+        let p = self.parent[i];
+        if p != NONE {
+            self.resort_child(p, n);
+            self.grow(p, delta, 0, 0, mtime);
+        }
+    }
+
+    /// Adds to `from` and every folder above it, keeping each folder's children sorted.
+    fn grow(&mut self, from: u32, bytes: i64, files: i64, dirs: i64, mtime: u32) {
+        let mut a = from;
+        while a != NONE {
+            let i = a as usize;
+            self.size[i] = (self.size[i] as i64 + bytes).max(0) as u64;
+            self.files[i] = (self.files[i] as i64 + files).max(0) as u32;
+            self.dirs[i] = (self.dirs[i] as i64 + dirs).max(0) as u32;
+            self.mtime[i] = self.mtime[i].max(mtime);
+            let up = self.parent[i];
+            if up != NONE {
+                self.resort_child(up, a);
+            }
+            a = up;
+        }
+    }
+
+    /// Every node at or below `n` (pre-order, largest first), skipping anything deleted.
+    pub fn subtree(&self, n: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut stack = vec![n];
+        std::iter::from_fn(move || {
+            let x = stack.pop()?;
+            stack.extend(self.kids(x).iter().rev());
+            Some(x)
+        })
+    }
+
+    /// Writes the whole tree in a compact binary form, read back by [`Tree::read_from`].
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        w.write_all(MAGIC)?;
+        w.write_all(&(self.len() as u64).to_le_bytes())?;
+        put_bytes(w, &self.names)?;
+        for v in [&self.name_off, &self.name_len, &self.parent, &self.child_start, &self.child_count, &self.files, &self.dirs, &self.mtime] {
+            put_u32s(w, v)?;
+        }
+        put_u32s(w, &self.children)?;
+        put_bytes(w, &self.size.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        put_bytes(w, &self.flags)?;
+        put_bytes(w, &self.kind)?;
+        put_bytes(w, &self.depth.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        w.write_all(&self.unreadable.to_le_bytes())?;
+        put_bytes(w, &self.online.iter().flat_map(|(k, v)| k.to_le_bytes().into_iter().chain(v.to_le_bytes())).collect::<Vec<u8>>())
+    }
+
+    /// Reads a tree written by [`Tree::write_to`], checking that it hangs together.
+    pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Tree> {
+        let bad = |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("damaged snapshot: {what}"));
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(bad("not a Diskie tree"));
+        }
+        let n = get_u64(r)? as usize;
+        let names = get_bytes(r)?;
+        let mut cols: Vec<Vec<u32>> = Vec::with_capacity(8);
+        for _ in 0..8 {
+            cols.push(get_u32s(r)?);
+        }
+        let children = get_u32s(r)?;
+        let size: Vec<u64> = get_bytes(r)?.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+        let flags = get_bytes(r)?;
+        let kind = get_bytes(r)?;
+        let depth: Vec<u16> = get_bytes(r)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let unreadable = get_u32(r)?;
+        let online = get_bytes(r)?
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .map(|c| (u32::from_le_bytes(c[..4].try_into().unwrap()), u64::from_le_bytes(c[4..].try_into().unwrap())))
+            .collect();
+        let mut it = cols.into_iter();
+        let mut col = || it.next().unwrap_or_default();
+        let t = Tree {
+            names,
+            name_off: col(),
+            name_len: col(),
+            parent: col(),
+            child_start: col(),
+            child_count: col(),
+            files: col(),
+            dirs: col(),
+            mtime: col(),
+            children,
+            size,
+            flags,
+            kind,
+            depth,
+            unreadable,
+            online,
+        };
+        let lens = [
+            t.name_off.len(),
+            t.name_len.len(),
+            t.parent.len(),
+            t.child_start.len(),
+            t.child_count.len(),
+            t.files.len(),
+            t.dirs.len(),
+            t.mtime.len(),
+            t.size.len(),
+            t.flags.len(),
+            t.kind.len(),
+            t.depth.len(),
+        ];
+        if n == 0 || lens.iter().any(|&l| l != n) {
+            return Err(bad("column lengths differ"));
+        }
+        for i in 0..n {
+            let (o, l) = (t.name_off[i] as usize, t.name_len[i] as usize);
+            let (s, c) = (t.child_start[i] as usize, t.child_count[i] as usize);
+            if o + l > t.names.len() || std::str::from_utf8(&t.names[o..o + l]).is_err() || s + c > t.children.len() {
+                return Err(bad("an entry points outside the tree"));
+            }
+            if t.parent[i] != NONE && t.parent[i] as usize >= n {
+                return Err(bad("a parent is missing"));
+            }
+        }
+        if t.children.iter().any(|&k| k as usize >= n) || t.online.keys().any(|&k| k as usize >= n) {
+            return Err(bad("a child is missing"));
+        }
+        Ok(t)
+    }
+}
+
+const MAGIC: &[u8; 8] = b"DSKTREE1";
+
+fn put_bytes(w: &mut impl std::io::Write, b: &[u8]) -> std::io::Result<()> {
+    w.write_all(&(b.len() as u64).to_le_bytes())?;
+    w.write_all(b)
+}
+
+fn put_u32s(w: &mut impl std::io::Write, v: &[u32]) -> std::io::Result<()> {
+    put_bytes(w, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+}
+
+fn get_u32(r: &mut impl std::io::Read) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn get_u64(r: &mut impl std::io::Read) -> std::io::Result<u64> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+fn get_bytes(r: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let len = get_u64(r)?;
+    if len > 1 << 40 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "damaged snapshot: impossible length"));
+    }
+    let mut v = Vec::new();
+    r.take(len).read_to_end(&mut v)?;
+    if v.len() as u64 != len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(v)
+}
+
+fn get_u32s(r: &mut impl std::io::Read) -> std::io::Result<Vec<u32>> {
+    Ok(get_bytes(r)?.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
 }
 
 #[cfg(test)]
@@ -453,6 +751,70 @@ mod tests {
         assert_eq!(t.size[0], 65);
         assert_eq!(t.dirs[0], 1);
         assert_eq!(t.kids(0).len(), 2);
+    }
+
+    #[test]
+    fn live_changes_keep_totals_and_order() {
+        let mut t = sample();
+        let b = by_name(&t, "b");
+        let c = by_name(&t, "c");
+        let n = t.add(c, "new.iso", 500, 99, 0);
+        assert_eq!(t.size[0], 705);
+        assert_eq!(t.files[b as usize], 2);
+        assert_eq!(t.mtime[0], 99);
+        let names: Vec<&str> = t.kids(0).iter().map(|&k| t.name(k)).collect();
+        assert_eq!(names, ["b", "a", "top.dll"], "b grew past the others");
+        assert_eq!(t.path(n), "C:\\b\\c\\new.iso");
+        assert_eq!(t.find_path("c:\\B\\c\\NEW.iso"), Some(n), "Windows paths ignore case");
+        assert_eq!(t.find_path("C:\\b\\nope"), None);
+        t.set_file(n, 10, 100, 0);
+        assert_eq!(t.size[0], 215);
+        let names: Vec<&str> = t.kids(0).iter().map(|&k| t.name(k)).collect();
+        assert_eq!(names, ["a", "top.dll", "b"]);
+        // Adding to a folder whose children aren't last in the list moves them, not the others.
+        let d = t.add(0, "d", 0, 0, flag::DIR);
+        t.add(b, "late.txt", 1, 0, 0);
+        t.add(d, "x", 3, 0, 0);
+        assert_eq!(t.kids(b).len(), 2);
+        assert_eq!(t.size[0], 219);
+        assert_eq!(t.dirs[0], 4);
+        assert_eq!(t.subtree(b).count(), 5);
+    }
+
+    #[test]
+    fn online_only_files_take_no_space() {
+        let mut c = Chunk::default();
+        c.push(1, 0, "OneDrive", 0, 0, flag::DIR);
+        c.push(NO_KEY, 1, "cloud.mp4", 1000, 0, flag::CLOUD);
+        c.push(NO_KEY, 1, "here.mp4", 10, 0, flag::SYNCED);
+        let t = Tree::build("C:\\", 0, vec![c], 4);
+        assert_eq!(t.size[0], 10);
+        assert_eq!(t.online_total(0), 1000);
+        assert_eq!(t.online_size(by_name(&t, "cloud.mp4")), 1000);
+        // OneDrive frees up space: the local copy becomes online only.
+        let mut t = t;
+        let here = by_name(&t, "here.mp4");
+        t.set_file(here, 10, 0, flag::CLOUD);
+        assert_eq!(t.size[0], 0);
+        assert_eq!(t.online_total(0), 1010);
+        t.set_file(here, 10, 0, flag::SYNCED);
+        assert_eq!(t.size[0], 10);
+        assert_eq!(t.online_total(0), 1000);
+    }
+
+    #[test]
+    fn round_trips_through_bytes() {
+        let mut t = sample();
+        t.add(0, "z", 7, 1, 0);
+        let mut buf = Vec::new();
+        t.write_to(&mut buf).unwrap();
+        let u = Tree::read_from(&mut buf.as_slice()).unwrap();
+        assert_eq!(u.len(), t.len());
+        assert_eq!(u.size, t.size);
+        assert_eq!(u.path(by_name(&u, "x.zip")), "C:\\b\\c\\x.zip");
+        assert_eq!(u.kids(0), t.kids(0));
+        buf.truncate(buf.len() / 2);
+        assert!(Tree::read_from(&mut buf.as_slice()).is_err());
     }
 
     #[test]

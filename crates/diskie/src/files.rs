@@ -124,6 +124,41 @@ impl Deletion {
 /// Deletes `path` without the Recycle Bin or Trash: a folder with everything in it, a file, or a
 /// link (only the link itself, never what it points to). Counts into `progress` as it goes, and
 /// fails with [`io::ErrorKind::Interrupted`] once [`Deletion::stop`] is called.
+/// Marks a cloud file (OneDrive and other providers using Windows cloud files) as online only,
+/// so the provider frees its local copy, or with `keep_local` as always kept on this device.
+/// A folder is changed with everything in it.
+#[cfg(windows)]
+pub fn set_cloud(path: &Path, dir: bool, keep_local: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let flags: [&str; 2] = if keep_local { ["+P", "-U"] } else { ["-P", "+U"] };
+    let attrib = std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").join("attrib.exe")).unwrap_or_else(|| "attrib.exe".into());
+    let run = |target: &Path, recurse: bool| -> Result<(), String> {
+        let mut cmd = std::process::Command::new(&attrib);
+        cmd.args(flags).arg(target).creation_flags(CREATE_NO_WINDOW);
+        if recurse {
+            cmd.args(["/S", "/D"]);
+        }
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Err(if text.is_empty() { format!("attrib failed ({})", out.status) } else { text })
+        }
+    };
+    run(path, false)?;
+    if dir {
+        run(&path.join("*"), true)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_cloud(_: &Path, _: bool, _: bool) -> Result<(), String> {
+    Err("online-only files are a Windows feature".into())
+}
+
 pub fn delete_permanently(path: &Path, progress: &Deletion) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     remove(path, &meta, progress)

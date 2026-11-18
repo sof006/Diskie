@@ -176,6 +176,29 @@ pub fn scan(root: &Path, opts: Options, progress: &Progress) -> Result<Scan, Err
     Ok(Scan { tree, backend: Backend::Walk, elapsed: t0.elapsed(), fallback, threads })
 }
 
+/// Cloud state from Windows file attributes: [`flag::CLOUD`] for a file that is online only
+/// (OneDrive and Dropbox placeholders: reading it would download it), [`flag::SYNCED`] for one
+/// kept in sync and stored here, 0 otherwise. Links must be ruled out before calling this.
+///
+/// [`flag::CLOUD`]: diskie_model::tree::flag::CLOUD
+/// [`flag::SYNCED`]: diskie_model::tree::flag::SYNCED
+pub fn cloud_flag(attributes: u32) -> u8 {
+    use diskie_model::tree::flag;
+    const REPARSE_POINT: u32 = 0x400;
+    const OFFLINE: u32 = 0x1000;
+    const RECALL_ON_OPEN: u32 = 0x4_0000;
+    const PINNED: u32 = 0x8_0000;
+    const UNPINNED: u32 = 0x10_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+    if attributes & (RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | OFFLINE) != 0 {
+        flag::CLOUD
+    } else if attributes & (REPARSE_POINT | PINNED | UNPINNED) != 0 {
+        flag::SYNCED
+    } else {
+        0
+    }
+}
+
 /// `C:` → `C:\`; strips a trailing separator from anything but a drive root.
 fn normalize(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();

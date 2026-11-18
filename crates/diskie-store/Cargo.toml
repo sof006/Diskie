@@ -1,0 +1,13 @@
+[package]
+name = "diskie-store"
+version.workspace = true
+description = "Saved scans (snapshots) for Diskie, to compare against later"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskie-model = { path = "../diskie-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = { version = "0.13", default-features = false }

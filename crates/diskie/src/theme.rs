@@ -115,7 +115,7 @@ pub fn kind_rgb(kind: u8) -> u32 {
     TABLE.get_or_init(|| KIND_OKLCH.map(|(l, c, h)| oklch_to_rgb(l, c, h)))[kind as usize % KIND_COUNT]
 }
 
-fn oklch_to_rgb(l: f32, c: f32, h_deg: f32) -> u32 {
+pub fn oklch_to_rgb(l: f32, c: f32, h_deg: f32) -> u32 {
     let h = h_deg.to_radians();
     let (a, b) = (c * h.cos(), c * h.sin());
     let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;

@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
+        run: cargo test -p diskie-model -p diskie-scan -p diskie-analyze -p diskie-store -p diskie-update -p diskie
       - name: Build
         run: cargo build --profile dist -p diskie
       - uses: actions/upload-artifact@v4
@@ -40,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test
-        run: cargo test -p diskie-model -p diskie-scan -p diskie-update -p diskie
+        run: cargo test -p diskie-model -p diskie-scan -p diskie-analyze -p diskie-store -p diskie-update -p diskie
       - name: Build
         run: cargo build --profile dist -p diskie
       - name: Package

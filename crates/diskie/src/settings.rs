@@ -27,11 +27,27 @@ pub struct Settings {
     pub use_mft: bool,
     /// Ask for administrator rights at startup (Windows).
     pub run_as_admin: bool,
+    /// What the treemap's colours show.
+    pub color_by: crate::colors::ColorBy,
+    /// Keep each scan, to show what changed next time.
+    pub snapshots: bool,
+    /// Watch the scanned folder and keep the numbers up to date.
+    pub live_updates: bool,
+    /// Show the owner column.
+    pub show_owner: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { updates: UpdateMode::Notify, last_update_check: 0, treemap_share: 0.46, use_mft: true, run_as_admin: true }
+        Self {
+            updates: UpdateMode::Notify,
+            last_update_check: 0, treemap_share: 0.46, use_mft: true,
+            run_as_admin: true,
+            color_by: Default::default(),
+            snapshots: true,
+            live_updates: true,
+            show_owner: false,
+        }
     }
 }
 

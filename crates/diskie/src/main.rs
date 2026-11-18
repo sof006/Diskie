@@ -5,11 +5,16 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bins;
+mod cli;
+mod colors;
 mod crash;
 mod files;
 mod frame;
 mod elevate;
 mod icons;
+mod live;
+mod owners;
 mod settings;
 mod theme;
 mod treemap_view;
@@ -18,7 +23,6 @@ mod words;
 /// The Linux desktop entry and Wayland app id.
 pub const APP_ID: &str = "io.github.sof006.Diskie";
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui_kit::*;
@@ -26,6 +30,10 @@ use gpui_kit::*;
 fn main() {
     crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `Diskie scan …` prints and exits: no window, and no elevation prompt.
+    if cli::wanted(&args) {
+        std::process::exit(cli::run(&args));
+    }
     if settings::Settings::load().run_as_admin && elevate::relaunch_elevated(&args) {
         return;
     }
@@ -56,7 +64,7 @@ fn main() {
                 notice = Some(format!("Diskie {failed} didn't start properly, so the previous version was restored."));
             }
             a if a.starts_with("--") || a.is_empty() => {}
-            a => start = Some(PathBuf::from(a)),
+            a => start = Some(cli::path_arg(a)),
         }
     }
 

@@ -11,6 +11,7 @@ use diskie_model::{Tree, fmt};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::colors::{self, ColorBy, LeafColor};
 use crate::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,6 +25,9 @@ pub struct MapKey {
     pub device_h: u32,
     pub generation: u64,
     pub dark: bool,
+    pub color: ColorBy,
+    /// Which comparison colours by change, when [`ColorBy::Change`].
+    pub diff: u64,
 }
 
 pub struct MapLayout {
@@ -32,6 +36,8 @@ pub struct MapLayout {
     /// Node → index of its rectangle.
     pub index: HashMap<u32, usize>,
     pub image: Arc<RenderImage>,
+    /// Each rectangle's colour when not coloured by type (empty when by type).
+    pub colors: Vec<u32>,
 }
 
 /// What the background job hands back.
@@ -40,6 +46,7 @@ pub struct Built {
     rects: Vec<MapRect>,
     index: HashMap<u32, usize>,
     pixels: Vec<u8>,
+    colors: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -57,7 +64,7 @@ pub struct MapState {
 
 impl MapState {
     /// The layout the current bounds call for, if the pane has been painted yet.
-    pub fn wanted(&self, scan: u64, zoom: u32, generation: u64, dark: bool) -> Option<MapKey> {
+    pub fn wanted(&self, scan: u64, zoom: u32, generation: u64, dark: bool, color: ColorBy, diff: u64) -> Option<MapKey> {
         let (w, h) = (self.bounds.size.width.as_f32(), self.bounds.size.height.as_f32());
         if w < 8.0 || h < 8.0 || self.scale <= 0.0 {
             return None;
@@ -71,6 +78,8 @@ impl MapState {
             device_h: (h * self.scale).round() as u32,
             generation,
             dark,
+            color,
+            diff: if color == ColorBy::Change { diff } else { 0 },
         })
     }
 
@@ -80,7 +89,7 @@ impl MapState {
         if let Some(old) = self.current.take() {
             self.stale.push(old.image.clone());
         }
-        self.current = Some(Rc::new(MapLayout { key: b.key, rects: b.rects, index: b.index, image }));
+        self.current = Some(Rc::new(MapLayout { key: b.key, rects: b.rects, index: b.index, image, colors: b.colors }));
         if self.pending == Some(b.key) {
             self.pending = None;
         }
@@ -114,12 +123,20 @@ impl MapState {
 }
 
 /// Runs off the UI thread.
-pub fn build(tree: Arc<Tree>, key: MapKey, palette: Palette) -> Built {
+pub fn build(tree: Arc<Tree>, key: MapKey, palette: Palette, leaf: Option<LeafColor>) -> Built {
     let rects = treemap::layout(&tree, key.zoom, key.w as f32, key.h as f32, &Options::default());
     let scale = key.device_w as f32 / key.w.max(1) as f32;
-    let pixels = treemap::rasterize(&tree, &rects, &palette, key.device_w, key.device_h, scale, true);
+    let (pixels, colors) = match leaf {
+        None => (treemap::rasterize(&tree, &rects, &palette, key.device_w, key.device_h, scale, true), Vec::new()),
+        Some(f) => {
+            let colors: Vec<u32> = rects.iter().map(|r| if r.group { 0 } else { f(&tree, r.node) }).collect();
+            let by_node: HashMap<u32, u32> = rects.iter().zip(&colors).map(|(r, &c)| (r.node, c)).collect();
+            let pick = |n: u32| by_node.get(&n).copied().unwrap_or(palette.background);
+            (treemap::rasterize_with(&tree, &rects, &palette, &pick, key.device_w, key.device_h, scale, true), colors)
+        }
+    };
     let index = rects.iter().enumerate().map(|(i, r)| (r.node, i)).collect();
-    Built { key, rects, index, pixels }
+    Built { key, rects, index, pixels, colors }
 }
 
 pub struct Paint {
@@ -129,6 +146,8 @@ pub struct Paint {
     pub theme: Theme,
     pub hovered: Option<u32>,
     pub selected: Option<u32>,
+    /// Also selected (Ctrl or Shift click), drawn lighter.
+    pub marked: Vec<u32>,
 }
 
 /// The canvas element. `state` is shared with the view, which schedules layouts.
@@ -166,7 +185,7 @@ pub fn element(state: Rc<RefCell<MapState>>, p: Paint) -> impl IntoElement {
             let mut bold = font.clone();
             bold.weight = FontWeight::SEMIBOLD;
             let tree = &p.tree;
-            for r in &l.rects {
+            for (i, r) in l.rects.iter().enumerate() {
                 let (w, h) = (r.w * sx, r.h * sy);
                 if r.group {
                     if r.header <= 0.0 || w < 48.0 {
@@ -181,8 +200,11 @@ pub fn element(state: Rc<RefCell<MapState>>, p: Paint) -> impl IntoElement {
                     };
                     label(window, cx, &bold, &text, rgb(t.head), ox + r.x * sx + 5.0, oy + r.y * sy + 1.0, w - 10.0);
                 } else if w >= 56.0 && h >= 18.0 {
-                    let k = tree.kind[r.node as usize];
-                    let ink = if t.kind_dark_ink(k) { rgba(0x141210e6) } else { rgba(0xffffffeb) };
+                    let dark = match l.colors.get(i) {
+                        Some(&c) => colors::dark_ink(c),
+                        None => t.kind_dark_ink(tree.kind[r.node as usize]),
+                    };
+                    let ink = if dark { rgba(0x141210e6) } else { rgba(0xffffffeb) };
                     label(window, cx, &bold, tree.name(r.node), ink, ox + r.x * sx + 5.0, oy + r.y * sy + 3.0, w - 10.0);
                     if h >= 34.0 {
                         label(window, cx, &font, &fmt::size(tree.size[r.node as usize]), ink, ox + r.x * sx + 5.0, oy + r.y * sy + 17.0, w - 10.0);
@@ -201,6 +223,13 @@ pub fn element(state: Rc<RefCell<MapState>>, p: Paint) -> impl IntoElement {
                 }
                 None
             };
+            for &m in &p.marked {
+                if let Some(r) = find(m) {
+                    let b = rect(r);
+                    window.paint_quad(fill(b, rgba(t.accent << 8 | 0x24)));
+                    window.paint_quad(outline(b, rgb(t.accent), BorderStyle::Solid));
+                }
+            }
             if let Some(r) = p.hovered.and_then(find) {
                 window.paint_quad(outline(rect(r), rgba(t.ring << 8 | 0xb0), BorderStyle::Solid));
             }
@@ -252,13 +281,13 @@ mod tests {
     fn a_layout_never_carries_over_to_another_scan() {
         let pal = Theme::DARK.palette();
         let mut s = state();
-        let big = s.wanted(1, Tree::ROOT, 0, true).unwrap();
-        s.install(build(tree(5000), big, pal));
+        let big = s.wanted(1, Tree::ROOT, 0, true, ColorBy::Type, 0).unwrap();
+        s.install(build(tree(5000), big, pal, None));
         let centre = point(px(200.), px(150.));
         assert!(s.hit(centre, 1).is_some_and(|n| n >= 1000), "the first scan's layout covers its big nodes");
 
         // The next scan: same pane, same zoom, same generation, different tree.
-        let next = s.wanted(2, Tree::ROOT, 0, true).unwrap();
+        let next = s.wanted(2, Tree::ROOT, 0, true, ColorBy::Type, 0).unwrap();
         assert_ne!(next, big, "the old layout must not count as up to date");
         assert_eq!(s.hit(centre, 2), None, "the old layout must not be hit-tested for the new scan");
         s.forget();

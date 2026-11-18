@@ -2,7 +2,9 @@
 resolver = "3"
 members = [
     "crates/diskie",
+    "crates/diskie-analyze",
     "crates/diskie-model",
+    "crates/diskie-store",
     "crates/diskie-scan",
     "crates/diskie-update",
     "xtask",
@@ -14,7 +16,7 @@ members = [
 default-members = ["crates/diskie"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false

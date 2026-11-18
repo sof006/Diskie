@@ -1,6 +1,7 @@
 //! The main window.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use diskie_model::tree::flag;
 use diskie_model::{KIND_COUNT, Kind, NONE, Tree, fmt};
 use diskie_scan::volumes::{self, Volume, VolumeKind};
 use diskie_scan::{Backend, Phase, Progress};
+use gpui_kit::base::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -19,6 +21,14 @@ use crate::settings::{self, Settings, UpdateMode};
 use crate::theme::Theme;
 use crate::words;
 use crate::treemap_view::{self, MapState, Paint};
+
+#[path = "ops.rs"]
+mod ops;
+#[path = "views.rs"]
+mod views;
+
+use ops::{ChangeTotals, LiveState, LiveWork, is_gone};
+use views::View;
 
 const ROW_H: f32 = 24.0;
 const TOOLBAR_H: f32 = 40.0;
@@ -44,6 +54,25 @@ pub struct Loaded {
     scan: u64,
     generation: u64,
     kind_totals: Option<(u32, u64, [u64; KIND_COUNT])>,
+    /// When the scan finished, Unix seconds.
+    taken: u64,
+    /// Also selected, with Ctrl or Shift.
+    marked: HashSet<u32>,
+    /// Where a Shift-click range starts.
+    anchor: Option<u32>,
+    list: Option<views::ListData>,
+    list_pending: Option<views::ListKey>,
+    dupes: views::Dupes,
+    /// The comparison with an earlier scan of the same place.
+    diff: Option<Arc<diskie_analyze::diff::Diff>>,
+    diff_id: u64,
+    compared: Option<diskie_store::Info>,
+    snapshots: Vec<diskie_store::Info>,
+    owners: HashMap<u32, Option<Arc<str>>>,
+    live: LiveState,
+    live_work: LiveWork,
+    age_totals: Option<(u32, u64, [u64; diskie_analyze::age::BUCKETS], u64)>,
+    change_totals: Option<(u32, u64, u64, ChangeTotals)>,
 }
 
 fn next_scan_id() -> u64 {
@@ -72,6 +101,21 @@ impl Loaded {
             scan: next_scan_id(),
             generation: 0,
             kind_totals: None,
+            taken: settings::now(),
+            marked: HashSet::new(),
+            anchor: None,
+            list: None,
+            list_pending: None,
+            dupes: views::Dupes { min_size: 1 << 20, ..Default::default() },
+            diff: None,
+            diff_id: 0,
+            compared: None,
+            snapshots: Vec::new(),
+            owners: HashMap::new(),
+            live: LiveState::Off,
+            live_work: LiveWork::default(),
+            age_totals: None,
+            change_totals: None,
         };
         l.rebuild_rows();
         l
@@ -142,11 +186,27 @@ struct Menu {
     extended: bool,
     /// The item's location has a Recycle Bin (Trash).
     bin: bool,
+    /// How many items the menu acts on.
+    count: usize,
+    /// A cloud file kept locally: it can be made online only.
+    free_up: bool,
+    /// An online-only cloud file (or a synced folder): it can be kept on this device.
+    keep_local: bool,
 }
 
 impl Menu {
-    fn new(at: Point<Pixels>, node: u32, extended: bool, tree: &Tree) -> Self {
-        Menu { at, node, extended, bin: volumes::has_recycle_bin(Path::new(&tree.path(node))) }
+    fn new(at: Point<Pixels>, node: u32, extended: bool, tree: &Tree, count: usize) -> Self {
+        let (synced, cloud) = (tree.has(node, flag::SYNCED), tree.has(node, flag::CLOUD));
+        let one = count == 1 && cfg!(windows);
+        Menu {
+            at,
+            node,
+            extended,
+            bin: volumes::has_recycle_bin(Path::new(&tree.path(node))),
+            count,
+            free_up: one && synced && !cloud,
+            keep_local: one && (cloud || (synced && tree.is_dir(node))),
+        }
     }
 }
 
@@ -169,6 +229,15 @@ pub struct Diskie {
     notice: Option<(String, bool)>,
     /// A delete under way, shown as a progress bar in place of the notice.
     deleting: Option<Deleting>,
+    view: View,
+    query: String,
+    search: Entity<InputState>,
+    /// The scroll position of the list views.
+    flat: UniformListScrollHandle,
+    list_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    list_job: Option<Task<()>>,
+    bins: Vec<crate::bins::Bin>,
+    owner_names: Arc<crate::owners::Owners>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -177,6 +246,8 @@ struct Deleting {
     permanent: bool,
     /// Files, folders and links the scan found in it: what the bar counts toward.
     total: u64,
+    /// How many things were picked.
+    items: usize,
     progress: Arc<crate::files::Deletion>,
     started: Instant,
 }
@@ -187,6 +258,18 @@ impl Diskie {
         window.focus(&focus, cx);
         let dark = is_dark(window);
         let settings = Settings::load();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search  (*.iso, >1GB, older:1y)").clean_on_escape());
+        cx.subscribe_in(&search, window, |this: &mut Self, state: &Entity<InputState>, ev: &InputEvent, _, cx| {
+            if matches!(ev, InputEvent::Change) {
+                this.query = state.read(cx).value().to_string();
+                if !this.query.trim().is_empty() && this.view != View::Search {
+                    this.view = View::Search;
+                    this.flat.scroll_to_item(0, ScrollStrategy::Top);
+                }
+                cx.notify();
+            }
+        })
+        .detach();
         let mut this = Self {
             theme: if dark { Theme::DARK } else { Theme::LIGHT },
             settings,
@@ -204,6 +287,14 @@ impl Diskie {
             update: UpdateState::Idle,
             notice: startup_notice.map(|n| (n, false)),
             deleting: None,
+            view: View::Tree,
+            query: String::new(),
+            search,
+            flat: UniformListScrollHandle::new(),
+            list_stop: None,
+            list_job: None,
+            bins: Vec::new(),
+            owner_names: Arc::default(),
             _tasks: Vec::new(),
         };
         let obs = cx.observe_window_appearance(window, |this: &mut Self, window, cx| {
@@ -216,6 +307,8 @@ impl Diskie {
             this.start_scan(p, window, cx);
         }
         this.schedule_update_check(cx);
+        this.live_loop(cx);
+        this.refresh_bins(cx);
         this
     }
 
@@ -249,8 +342,10 @@ impl Diskie {
                         this.loaded = Some(Loaded::new(scan, root.clone()));
                         this.scan = ScanState::Idle;
                         this.list.scroll_to_item(0, ScrollStrategy::Top);
+                        this.flat.scroll_to_item(0, ScrollStrategy::Top);
                         this.map.borrow_mut().forget();
                         this.volumes = volumes::list_volumes();
+                        this.after_load(cx);
                     }
                     Err(diskie_scan::Error::Cancelled) => {
                         this.scan = ScanState::Idle;
@@ -324,6 +419,8 @@ impl Diskie {
     fn select(&mut self, n: u32, reveal: bool, cx: &mut Context<Self>) {
         let Some(l) = self.loaded.as_mut() else { return };
         l.selected = Some(n);
+        l.marked.clear();
+        l.anchor = Some(n);
         if reveal && let Some(i) = l.reveal(n) {
             self.list.scroll_to_item(i, ScrollStrategy::Nearest);
         }
@@ -366,9 +463,28 @@ impl Diskie {
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.view != View::Tree {
+            let nodes = self.visible_nodes();
+            let Some(l) = self.loaded.as_mut() else { return };
+            if nodes.is_empty() {
+                return;
+            }
+            let next = match l.selected.and_then(|s| nodes.iter().position(|&r| r == s)) {
+                Some(cur) => (cur as isize).saturating_add(delta).clamp(0, nodes.len() as isize - 1) as usize,
+                None => 0,
+            };
+            let n = nodes[next];
+            l.selected = Some(n);
+            l.marked.clear();
+            l.anchor = Some(n);
+            let row = l.list.as_ref().and_then(|d| d.rows.iter().position(|r| matches!(r, views::Row::Node(x) if *x == n))).unwrap_or(0);
+            self.flat.scroll_to_item(row, ScrollStrategy::Nearest);
+            cx.notify();
+            return;
+        }
         let Some(l) = self.loaded.as_ref() else { return };
         let cur = l.selected.and_then(|s| l.rows.iter().position(|&r| r == s)).unwrap_or(0);
-        let next = (cur as isize + delta).clamp(0, l.rows.len() as isize - 1) as usize;
+        let next = (cur as isize).saturating_add(delta).clamp(0, l.rows.len() as isize - 1) as usize;
         let n = l.rows[next];
         self.select(n, true, cx);
     }
@@ -376,11 +492,32 @@ impl Diskie {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         let ctrl = k.modifiers.control || k.modifiers.platform;
+        // While typing in the search box its keys are its own. Escape clears it (the box does
+        // that), and once empty, or with Down or Enter, goes back to the results.
+        if self.search.read(cx).focus_handle(cx).is_focused(window) {
+            let leave = match k.key.as_str() {
+                "escape" => self.query.is_empty(),
+                "down" | "enter" => true,
+                _ => false,
+            };
+            if leave {
+                window.focus(&self.focus, cx);
+            }
+            if !(k.key == "f5" || (ctrl && k.key == "o")) {
+                return;
+            }
+        }
         match k.key.as_str() {
             "f5" => self.rescan(window, cx),
             "o" if ctrl => self.pick_folder(window, cx),
+            "f" if ctrl => self.search.update(cx, |s, cx| s.focus(window, cx)),
             "escape" => {
                 if self.menu.take().is_some() {
+                    cx.notify();
+                } else if let Some(l) = self.loaded.as_mut()
+                    && !l.marked.is_empty()
+                {
+                    l.marked.clear();
                     cx.notify();
                 } else if matches!(self.scan, ScanState::Running { .. }) {
                     self.cancel_scan(cx);
@@ -390,20 +527,23 @@ impl Diskie {
         }
         let Some(l) = self.loaded.as_ref() else { return };
         let sel = l.selected.unwrap_or(Tree::ROOT);
+        let tree_view = self.view == View::Tree;
         match k.key.as_str() {
             "down" => self.move_selection(1, cx),
             "up" => self.move_selection(-1, cx),
             "pagedown" => self.move_selection(20, cx),
             "pageup" => self.move_selection(-20, cx),
-            "home" => self.select(Tree::ROOT, true, cx),
-            "right" => {
+            "home" if tree_view => self.select(Tree::ROOT, true, cx),
+            "home" => self.move_selection(isize::MIN, cx),
+            "end" if !tree_view => self.move_selection(isize::MAX, cx),
+            "right" if tree_view => {
                 if !l.expanded[sel as usize] && !l.tree.kids(sel).is_empty() {
                     self.toggle(sel, cx);
                 } else if let Some(&first) = l.tree.kids(sel).first() {
                     self.select(first, true, cx);
                 }
             }
-            "left" => {
+            "left" if tree_view => {
                 if l.expanded[sel as usize] && sel != Tree::ROOT {
                     self.toggle(sel, cx);
                 } else if l.tree.parent[sel as usize] != NONE {
@@ -411,10 +551,24 @@ impl Diskie {
                     self.select(p, true, cx);
                 }
             }
-            "enter" => self.zoom_to(sel, cx),
+            "enter" if tree_view => self.zoom_to(sel, cx),
+            "enter" => self.show_in_tree(sel, cx),
             "backspace" => self.zoom_out(cx),
-            "delete" => self.remove(sel, k.modifiers.shift, window, cx),
-            "c" if ctrl => self.copy_path(sel, cx),
+            "delete" => {
+                let nodes = self.chosen();
+                self.remove(nodes, k.modifiers.shift, window, cx);
+            }
+            "c" if ctrl => {
+                let nodes = self.chosen();
+                self.copy_paths(nodes, cx);
+            }
+            "a" if ctrl && !tree_view => {
+                let all = self.visible_nodes();
+                if let Some(l) = self.loaded.as_mut() {
+                    l.marked = all.into_iter().collect();
+                }
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -422,10 +576,13 @@ impl Diskie {
     // ------------------------------------------------------------------------------------
     // Actions on files
 
-    fn copy_path(&mut self, n: u32, cx: &mut Context<Self>) {
-        if let Some(l) = &self.loaded {
-            cx.write_to_clipboard(ClipboardItem::new_string(l.tree.path(n)));
-            self.notice = Some(("Path copied".into(), false));
+    fn copy_paths(&mut self, nodes: Vec<u32>, cx: &mut Context<Self>) {
+        if let Some(l) = &self.loaded
+            && !nodes.is_empty()
+        {
+            let text: Vec<String> = nodes.iter().map(|&n| l.tree.path(n)).collect();
+            cx.write_to_clipboard(ClipboardItem::new_string(text.join(if cfg!(windows) { "\r\n" } else { "\n" })));
+            self.notice = Some((if nodes.len() == 1 { "Path copied".into() } else { format!("{} paths copied", fmt::count(nodes.len() as u64)) }, false));
             cx.notify();
         }
     }
@@ -446,9 +603,26 @@ impl Diskie {
     }
 
     /// Moves to the Recycle Bin (Trash), or with `permanent` deletes for good. Both ask first.
-    fn remove(&mut self, n: u32, permanent: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn remove(&mut self, nodes: Vec<u32>, permanent: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(l) = &self.loaded else { return };
-        if !removable(&l.tree, n) {
+        let tree = &l.tree;
+        // Only what can be deleted, and of an item and something inside it only the item.
+        let picked: HashSet<u32> = nodes.into_iter().filter(|&n| removable(tree, n) && !is_gone(tree, n)).collect();
+        let mut nodes: Vec<u32> = picked
+            .iter()
+            .copied()
+            .filter(|&n| {
+                let mut a = tree.parent[n as usize];
+                while a != NONE {
+                    if picked.contains(&a) {
+                        return false;
+                    }
+                    a = tree.parent[a as usize];
+                }
+                true
+            })
+            .collect();
+        if nodes.is_empty() {
             return;
         }
         if let Some(d) = &self.deleting {
@@ -456,35 +630,57 @@ impl Diskie {
             cx.notify();
             return;
         }
-        let path = l.tree.path(n);
+        nodes.sort_by_key(|&n| std::cmp::Reverse(tree.size[n as usize]));
+        // (path, items in it, bytes) for each.
+        let jobs: Vec<(String, u64, u64)> = nodes
+            .iter()
+            .map(|&n| (tree.path(n), tree.files[n as usize] as u64 + tree.dirs[n as usize] as u64 + tree.is_dir(n) as u64, tree.size[n as usize]))
+            .collect();
+        let total: u64 = jobs.iter().map(|j| j.1).sum();
+        let bytes: u64 = jobs.iter().map(|j| j.2).sum();
         let scan = l.scan;
-        let total = l.tree.files[n as usize] as u64 + l.tree.dirs[n as usize] as u64 + l.tree.is_dir(n) as u64;
-        if !permanent && !volumes::has_recycle_bin(Path::new(&path)) {
+        if !permanent && jobs.iter().any(|j| !volumes::has_recycle_bin(Path::new(&j.0))) {
             self.notice = Some((words::NO_BIN.into(), true));
             cx.notify();
             return;
         }
-        let name = l.tree.name(n).to_string();
-        let mut detail = if l.tree.is_dir(n) {
-            let (files, dirs) = (l.tree.files[n as usize] as u64, l.tree.dirs[n as usize] as u64);
-            let many = |n: u64, one: &str, more: &str| format!("{} {}", fmt::count(n), if n == 1 { one } else { more });
-            format!("{}, {} in {}.\n{path}", fmt::size(l.tree.size[n as usize]), many(files, "file", "files"), many(dirs, "folder", "folders"))
+        let many = |n: u64, one: &str, more: &str| format!("{} {}", fmt::count(n), if n == 1 { one } else { more });
+        let (name, shown, mut detail) = if let [n] = nodes[..] {
+            let name = tree.name(n).to_string();
+            let path = &jobs[0].0;
+            let detail = if tree.is_dir(n) {
+                let (files, dirs) = (tree.files[n as usize] as u64, tree.dirs[n as usize] as u64);
+                format!("{}, {} in {}.\n{path}", fmt::size(bytes), many(files, "file", "files"), many(dirs, "folder", "folders"))
+            } else {
+                format!("{}.\n{path}", fmt::size(bytes))
+            };
+            (name.clone(), format!("“{name}”"), detail)
         } else {
-            format!("{}.\n{path}", fmt::size(l.tree.size[n as usize]))
+            let name = many(nodes.len() as u64, "item", "items");
+            let mut d = format!("{} in {name}:", fmt::size(bytes));
+            for j in jobs.iter().take(8) {
+                d.push('\n');
+                d.push_str(&j.0);
+            }
+            if jobs.len() > 8 {
+                d.push_str(&format!("\n… and {} more", fmt::count(jobs.len() as u64 - 8)));
+            }
+            (name.clone(), name, d)
         };
-        if words::is_system_path(&path) {
+        if jobs.iter().any(|j| words::is_system_path(&j.0)) {
             detail.push_str("\n\n");
             detail.push_str(words::SYSTEM_WARNING);
         }
         let bin = words::BIN;
         let (level, title, confirm) = if permanent {
             detail.push_str(&format!("\n\nThis can't be undone: it is deleted for good, not moved to the {bin}."));
-            (PromptLevel::Critical, format!("Permanently delete “{name}”?"), "Delete permanently".to_string())
+            (PromptLevel::Critical, format!("Permanently delete {shown}?"), "Delete permanently".to_string())
         } else {
-            (PromptLevel::Warning, format!("Move “{name}” to the {bin}?"), format!("Move to {bin}"))
+            (PromptLevel::Warning, format!("Move {shown} to the {bin}?"), format!("Move to {bin}"))
         };
         let answer = window.prompt(level, &title, Some(&detail), &[confirm.as_str(), "Cancel"], cx);
         self.menu = None;
+        let items = nodes.len();
         let task = cx.spawn(async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
@@ -496,8 +692,7 @@ impl Diskie {
                     cx.notify();
                     return false;
                 }
-                this.deleting =
-                    Some(Deleting { name: name.clone(), permanent, total, progress: progress.clone(), started: Instant::now() });
+                this.deleting = Some(Deleting { name: name.clone(), permanent, total, items, progress: progress.clone(), started: Instant::now() });
                 this.notice = None;
                 // Repaint the bar ten times a second until the delete is over.
                 let ticker = cx.spawn(async move |this, cx| {
@@ -519,62 +714,77 @@ impl Diskie {
             if !matches!(started, Ok(true)) {
                 return;
             }
-            let (p2, progress2) = (path.clone(), progress.clone());
-            let result = cx
+            let p2 = progress.clone();
+            // One result per item, in order, up to the first that fails or a Stop.
+            let results: Vec<Result<(), String>> = cx
                 .background_spawn(async move {
-                    if permanent {
-                        crate::files::delete_permanently(Path::new(&p2), &progress2).map_err(|e| e.to_string())
-                    } else {
-                        trash::delete(&p2).map_err(|e| e.to_string())
+                    let mut out = Vec::new();
+                    for (path, count, size) in &jobs {
+                        if p2.stopping() {
+                            break;
+                        }
+                        let r = if permanent {
+                            crate::files::delete_permanently(Path::new(path), &p2).map_err(|e| e.to_string())
+                        } else {
+                            trash::delete(path).map_err(|e| e.to_string()).map(|_| {
+                                p2.removed.fetch_add(*count, Relaxed);
+                                p2.bytes.fetch_add(*size, Relaxed);
+                            })
+                        };
+                        let failed = r.is_err();
+                        out.push(r);
+                        if failed {
+                            break;
+                        }
                     }
+                    out
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.deleting = None;
-                // After a rescan, `n` is some other item.
+                let ok = results.iter().take_while(|r| r.is_ok()).count();
+                let error = results.iter().find_map(|r| r.as_ref().err().cloned());
+                let finished = ok == nodes.len();
+                // After a rescan, `nodes` are some other items.
                 let same_scan = this.loaded.as_ref().is_some_and(|l| l.scan == scan);
-                match result {
-                    Ok(()) if !same_scan => {
-                        this.notice = Some((format!("Deleted {name}. Rescan (F5) to see the space it freed."), false));
-                    }
-                    Ok(()) => {
-                        if let Some(l) = this.loaded.as_mut() {
-                            let tree = Arc::make_mut(&mut l.tree);
-                            let freed = tree.size[n as usize];
-                            let parent = tree.parent[n as usize];
+                let mut freed = 0;
+                if let Some(l) = this.loaded.as_mut().filter(|_| same_scan && ok > 0) {
+                    let tree = Arc::make_mut(&mut l.tree);
+                    for &n in &nodes[..ok] {
+                        if !is_gone(tree, n) {
+                            freed += tree.size[n as usize];
                             tree.remove(n);
-                            l.generation += 1;
-                            if l.tree.is_ancestor(n, l.zoom) {
-                                l.zoom = parent;
-                            }
-                            l.selected = Some(parent);
-                            l.rebuild_rows();
-                            l.space = volumes::space(&l.root);
-                            this.notice = Some((
-                                if permanent {
-                                    format!("Deleted {name} permanently ({})", fmt::size(freed))
-                                } else {
-                                    format!("Moved {name} to the {} ({})", words::BIN, fmt::size(freed))
-                                },
-                                false,
-                            ));
                         }
                     }
+                    l.marked.clear();
+                    l.tidy();
+                }
+                let (removed, moved) = (progress.removed.load(Relaxed).min(total), progress.bytes.load(Relaxed));
+                this.notice = Some(if finished && !same_scan {
+                    (format!("Deleted {name}. Rescan (F5) to see the space it freed."), false)
+                } else if finished && permanent {
+                    (format!("Deleted {name} permanently ({})", fmt::size(freed)), false)
+                } else if finished {
+                    (format!("Moved {name} to the {} ({})", words::BIN, fmt::size(freed)), false)
+                } else if permanent {
                     // A folder may be partly deleted by now, so the tree no longer says what's left.
-                    Err(e) if permanent => {
-                        let (removed, freed) = (progress.removed.load(Relaxed), progress.bytes.load(Relaxed));
-                        let done =
-                            format!("{} of {} items ({}) were deleted", fmt::count(removed.min(total)), fmt::count(total), fmt::size(freed));
-                        this.notice = Some(if progress.stopping() {
-                            (format!("Stopped deleting {name}: {done}. Rescan (F5) to see what is left."), false)
-                        } else {
-                            (format!("Couldn't delete all of {name}: {e}. {done}; rescan (F5) to see what is left."), true)
-                        });
-                        if let Some(l) = this.loaded.as_mut() {
-                            l.space = volumes::space(&l.root);
-                        }
+                    let done = format!("{} of {} items ({}) were deleted", fmt::count(removed), fmt::count(total), fmt::size(moved));
+                    match error {
+                        None => (format!("Stopped deleting {name}: {done}. Rescan (F5) to see what is left."), false),
+                        Some(e) => (format!("Couldn't delete all of {name}: {e}. {done}; rescan (F5) to see what is left."), true),
                     }
-                    Err(e) => this.notice = Some((format!("Could not move {name} to the {}: {e}", words::BIN), true)),
+                } else {
+                    let done = if ok > 0 { format!(" {} of {} were moved.", fmt::count(ok as u64), fmt::count(nodes.len() as u64)) } else { String::new() };
+                    match error {
+                        None => (format!("Stopped moving {name} to the {}.{done}", words::BIN), false),
+                        Some(e) => (format!("Could not move {name} to the {}: {e}.{done}", words::BIN), true),
+                    }
+                });
+                if let Some(l) = this.loaded.as_mut() {
+                    l.space = volumes::space(&l.root);
+                }
+                if !permanent && ok > 0 {
+                    this.refresh_bins(cx);
                 }
                 cx.notify();
             });
@@ -697,7 +907,7 @@ impl Diskie {
 
     fn schedule_map(&mut self, cx: &mut Context<Self>) {
         let Some(l) = &self.loaded else { return };
-        let wanted = self.map.borrow().wanted(l.scan, l.zoom, l.generation, self.theme.dark);
+        let wanted = self.map.borrow().wanted(l.scan, l.zoom, l.generation, self.theme.dark, self.settings.color_by, l.diff_id);
         let Some(key) = wanted else { return };
         {
             let m = self.map.borrow();
@@ -710,7 +920,8 @@ impl Diskie {
         }
         self.map.borrow_mut().pending = Some(key);
         let (tree, palette) = (l.tree.clone(), self.theme.palette());
-        let job = cx.background_spawn(async move { crate::crash::guard(|| treemap_view::build(tree, key, palette)) });
+        let leaf = crate::colors::leaf(self.settings.color_by, &self.theme, settings::now(), l.diff.clone());
+        let job = cx.background_spawn(async move { crate::crash::guard(|| treemap_view::build(tree, key, palette, leaf)) });
         self.map_job = Some(cx.spawn(async move |this, cx| {
             let built = job.await;
             let _ = this.update(cx, |this, cx| {
@@ -811,6 +1022,29 @@ impl Diskie {
             )
             .child(div().flex_1().min_w_0().child(crumbs))
             .child(
+                div()
+                    .w(px(260.))
+                    .h(px(28.))
+                    .flex_none()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(rgb(if self.query.is_empty() { t.btn_line } else { t.accent }))
+                    .bg(rgb(t.canvas))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(self.icon("search", t.faint).size(px(14.)))
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.search))),
+            )
+            .child(
+                self.button("export", "share", "Export")
+                    .when(self.loaded.is_none(), |d| d.opacity(0.4))
+                    .tooltip(move |_, cx| cx.new(|_| Tip { text: "Save what this view lists as CSV (or JSON, by naming the file .json)".into(), theme: t }).into())
+                    .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
+            )
+            .child(
                 self.button("rescan", "refresh", "Rescan")
                     .when(!can_rescan, |d| d.opacity(0.4))
                     .on_click(cx.listener(|this, _, window, cx| this.rescan(window, cx))),
@@ -838,6 +1072,7 @@ impl Diskie {
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
+        let bins = self.bins_section(cx);
         let active_root = self.loaded.as_ref().map(|l| l.root.to_string_lossy().to_string());
         let heading = |s: &'static str| {
             div().px_3().pt_3().pb_1().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(rgb(t.faint)).child(s)
@@ -888,7 +1123,7 @@ impl Diskie {
                     .on_click(cx.listener(move |this, _, window, cx| this.start_scan(root.clone(), window, cx))),
             );
         }
-        list = list.child(heading("NETWORK AND FOLDERS")).child(
+        list = list.children(bins).child(heading("NETWORK AND FOLDERS")).child(
             div()
                 .id("pick")
                 .mx_1p5()
@@ -942,18 +1177,32 @@ impl Diskie {
 
     fn rows(&mut self, range: std::ops::Range<usize>, cx: &mut Context<Self>) -> Vec<Stateful<Div>> {
         let t = self.theme;
+        let show_owner = self.settings.show_owner;
+        let mut want_owner = Vec::new();
         let Some(l) = &self.loaded else { return Vec::new() };
         let tree = &l.tree;
         let now = settings::now();
-        range
+        let rows = range
             .filter_map(|i| l.rows.get(i).copied())
             .map(|n| {
                 let ni = n as usize;
                 let is_dir = tree.is_dir(n);
                 let has_kids = !tree.kids(n).is_empty();
                 let expanded = l.expanded[ni];
-                let selected = l.selected == Some(n);
+                let selected = l.selected == Some(n) || l.marked.contains(&n);
                 let hovered = l.hovered == Some(n);
+                let owner = if show_owner {
+                    match l.owners.get(&n) {
+                        Some(Some(o)) => o.to_string(),
+                        Some(None) => String::new(),
+                        None => {
+                            want_owner.push(n);
+                            "…".into()
+                        }
+                    }
+                } else {
+                    String::new()
+                };
                 let pct = tree.percent_of_parent(n);
                 let depth = tree.depth[ni] as f32;
                 let unreadable = tree.has(n, flag::UNREADABLE);
@@ -1020,6 +1269,7 @@ impl Diskie {
                     .child(num(fmt::percent(pct), 52.).text_color(rgb(t.muted)))
                     .child(num(if is_dir { fmt::count(tree.files[ni] as u64) } else { String::new() }, 72.).text_color(rgb(t.muted)))
                     .child(num(fmt::age(tree.mtime[ni], now), 56.).text_color(rgb(t.muted)))
+                    .when(show_owner, |d| d.child(div().w(px(130.)).flex_none().truncate().text_color(rgb(t.muted)).child(owner)))
                     .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
                         if let Some(l) = this.loaded.as_mut() {
                             let h = if *hovering { Some(n) } else { None };
@@ -1029,42 +1279,25 @@ impl Diskie {
                             }
                         }
                     }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                        this.focus.focus(window, cx);
-                        this.menu = None;
-                        if ev.click_count >= 2 {
-                            if mount {
-                                // Another file system isn't part of this scan: scan it on its own.
-                                if let Some(l) = &this.loaded {
-                                    let path = PathBuf::from(l.tree.path(n));
-                                    this.start_scan(path, window, cx);
-                                }
-                            } else if is_dir {
-                                this.zoom_to(n, cx);
-                            } else {
-                                this.reveal_in_explorer(n, cx);
-                            }
-                        } else {
-                            this.select(n, false, cx);
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        this.select(n, false, cx);
-                        this.menu = this.loaded.as_ref().map(|l| Menu::new(ev.position, n, ev.modifiers.shift, &l.tree));
-                        cx.notify();
-                    }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, window, cx| this.row_down(n, ev, window, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _, cx| this.open_menu(n, ev, cx)))
             })
-            .collect()
+            .collect();
+        if !want_owner.is_empty() {
+            self.request_owners(want_owner, cx);
+        }
+        rows
     }
 
     fn table(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
         let count = self.loaded.as_ref().map(|l| l.rows.len()).unwrap_or(0);
+        let show_owner = self.settings.show_owner;
         let head = |s: &'static str, w: f32| div().w(px(w)).flex_none().flex().justify_end().child(s);
         div()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
+            .w_full()
             .flex()
             .flex_col()
             .child(
@@ -1085,7 +1318,8 @@ impl Diskie {
                     .child(div().w(px(96.)).flex_none().child("OF PARENT"))
                     .child(head("", 52.))
                     .child(head("FILES", 72.))
-                    .child(head("MODIFIED", 56.)),
+                    .child(head("MODIFIED", 56.))
+                    .when(show_owner, |d| d.child(div().w(px(130.)).flex_none().child("OWNER"))),
             )
             .child(
                 uniform_list("tree", count, cx.processor(|this: &mut Self, range, _, cx| this.rows(range, cx)))
@@ -1095,66 +1329,12 @@ impl Diskie {
             )
     }
 
-    fn types_panel(&mut self) -> impl IntoElement + use<> {
-        let t = self.theme;
-        let mut col = div().flex().flex_col().gap_0p5().px_3().pt_2();
-        if let Some(l) = self.loaded.as_mut() {
-            let totals = l.kind_totals();
-            let all: u64 = totals.iter().sum::<u64>().max(1);
-            let mut order: Vec<usize> = (0..KIND_COUNT).filter(|&k| totals[k] > 0).collect();
-            order.sort_by_key(|&k| std::cmp::Reverse(totals[k]));
-            for k in order {
-                let frac = totals[k] as f32 / all as f32;
-                col = col.child(
-                    div()
-                        .py_1()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(div().size(px(10.)).flex_none().rounded(px(2.)).bg(rgb(t.kind(k as u8))))
-                                .child(div().flex_1().min_w_0().truncate().child(Kind::from_u8(k as u8).label()))
-                                .child(div().flex_none().child(fmt::size(totals[k]))),
-                        )
-                        .child(
-                            div()
-                                .ml(px(18.))
-                                .h(px(3.))
-                                .rounded(px(2.))
-                                .bg(rgb(t.track))
-                                .child(div().h_full().rounded(px(2.)).w(relative(frac)).bg(rgb(t.kind(k as u8)))),
-                        ),
-                );
-            }
-        }
-        div()
-            .w(px(TYPES_W))
-            .flex_none()
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_l_1()
-            .border_color(rgb(t.line))
-            .bg(rgb(t.panel))
-            .child(
-                div()
-                    .h(px(28.))
-                    .flex_none()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(t.faint))
-                    .border_b_1()
-                    .border_color(rgb(t.line))
-                    .child("FILE TYPES"),
-            )
-            .child(div().id("types").flex_1().min_h_0().overflow_y_scroll().child(col))
+    /// The view tabs and the tree or list below them.
+    fn results(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_list(cx);
+        let tabs = self.tabs(cx);
+        let body = if self.view == View::Tree { self.table(cx).into_any_element() } else { self.flat_table(cx) };
+        div().flex_1().min_w_0().h_full().flex().flex_col().child(tabs).child(body).into_any_element()
     }
 
     fn map_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1173,7 +1353,7 @@ impl Diskie {
             }
             s
         };
-        let paint = Paint { tree: l.tree.clone(), scan: l.scan, theme: t, hovered: l.hovered, selected: l.selected };
+        let paint = Paint { tree: l.tree.clone(), scan: l.scan, theme: t, hovered: l.hovered, selected: l.selected, marked: ops::marked_for_map(&l.marked) };
         div()
             .size_full()
             .flex()
@@ -1220,7 +1400,9 @@ impl Diskie {
                         this.focus.focus(window, cx);
                         this.menu = None;
                         let Some(n) = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan)) else { return };
-                        if ev.click_count >= 2 {
+                        if ev.modifiers.control || ev.modifiers.platform || ev.modifiers.shift {
+                            this.row_down(n, ev, window, cx);
+                        } else if ev.click_count >= 2 {
                             this.zoom_to(n, cx);
                         } else {
                             this.select(n, true, cx);
@@ -1228,9 +1410,10 @@ impl Diskie {
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                         let Some(n) = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan)) else { return };
-                        this.select(n, true, cx);
-                        this.menu = this.loaded.as_ref().map(|l| Menu::new(ev.position, n, ev.modifiers.shift, &l.tree));
-                        cx.notify();
+                        if !this.loaded.as_ref().is_some_and(|l| l.marked.contains(&n)) {
+                            this.select(n, true, cx);
+                        }
+                        this.open_menu(n, ev, cx);
                     }))
                     .child(treemap_view::element(self.map.clone(), paint)),
             )
@@ -1242,10 +1425,13 @@ impl Diskie {
         let m = self.menu.as_ref()?;
         let l = self.loaded.as_ref()?;
         let n = m.node;
+        let count = m.count;
         let is_dir = l.tree.is_dir(n);
-        let deletable = removable(&l.tree, n);
+        let deletable = count > 1 || removable(&l.tree, n);
         let (offer_bin, offer_permanent) = (m.bin, m.extended || !m.bin);
-        let item = |id: &'static str, icon: &'static str, label: &'static str, color: u32| {
+        let (free_up, keep_local) = (m.free_up, m.keep_local);
+        let flat = self.view != View::Tree;
+        let item = |id: &'static str, icon: &'static str, label: SharedString, color: u32| {
             div()
                 .id(id)
                 .h(px(28.))
@@ -1261,8 +1447,14 @@ impl Diskie {
                 .child(svg().path(icons::path(icon)).size(px(15.)).text_color(rgb(color)))
                 .child(label)
         };
+        let (bin_label, delete_label, copy_label): (SharedString, SharedString, SharedString) = if count > 1 {
+            (format!("Move {count} items to the {}", words::BIN).into(), format!("Delete {count} items permanently…").into(), "Copy paths".into())
+        } else {
+            (words::MOVE_TO_BIN.into(), "Delete permanently…".into(), "Copy path".into())
+        };
+        let separator = || div().my_1().h(px(1.)).bg(rgb(t.line));
         let menu = div()
-            .w(px(220.))
+            .w(px(240.))
             .py_1()
             .flex()
             .flex_col()
@@ -1275,34 +1467,46 @@ impl Diskie {
                 this.menu = None;
                 cx.notify();
             }))
-            .when(is_dir, |d| {
-                d.child(item("m-zoom", "zoom-in", "Zoom in here", t.text).on_click(cx.listener(move |this, _, _, cx| {
+            .when(is_dir && count == 1, |d| {
+                d.child(item("m-zoom", "zoom-in", "Zoom in here".into(), t.text).on_click(cx.listener(move |this, _, _, cx| {
                     this.menu = None;
+                    this.view = View::Tree;
                     this.zoom_to(n, cx);
                 })))
             })
-            .child(item("m-reveal", "external", words::SHOW_IN_FILES, t.text).on_click(cx.listener(move |this, _, _, cx| {
+            .when(flat, |d| d.child(item("m-tree", "list-tree", "Show in tree".into(), t.text).on_click(cx.listener(move |this, _, _, cx| this.show_in_tree(n, cx)))))
+            .child(item("m-reveal", "external", words::SHOW_IN_FILES.into(), t.text).on_click(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
                 this.reveal_in_explorer(n, cx);
                 cx.notify();
             })))
-            .child(item("m-copy", "copy", "Copy path", t.text).on_click(cx.listener(move |this, _, _, cx| {
+            .child(item("m-copy", "copy", copy_label, t.text).on_click(cx.listener(move |this, _, _, cx| {
                 this.menu = None;
-                this.copy_path(n, cx);
+                let nodes = this.chosen();
+                this.copy_paths(nodes, cx);
             })))
+            .when(free_up || keep_local, |d| {
+                d.child(separator())
+                    .when(free_up, |d| {
+                        d.child(item("m-free", "cloud", "Free up space (online only)".into(), t.text).on_click(cx.listener(move |this, _, _, cx| this.set_cloud(n, false, cx))))
+                    })
+                    .when(keep_local, |d| {
+                        d.child(item("m-keep", "download", "Always keep on this device".into(), t.text).on_click(cx.listener(move |this, _, _, cx| this.set_cloud(n, true, cx))))
+                    })
+            })
             .when(deletable, |d| {
-                d.child(div().my_1().h(px(1.)).bg(rgb(t.line)))
+                d.child(separator())
                     .when(offer_bin, |d| {
-                        d.child(
-                            item("m-trash", "trash", words::MOVE_TO_BIN, t.danger)
-                                .on_click(cx.listener(move |this, _, window, cx| this.remove(n, false, window, cx))),
-                        )
+                        d.child(item("m-trash", "trash", bin_label, t.danger).on_click(cx.listener(move |this, _, window, cx| {
+                            let nodes = this.chosen();
+                            this.remove(nodes, false, window, cx);
+                        })))
                     })
                     .when(offer_permanent, |d| {
-                        d.child(
-                            item("m-delete", "x", "Delete permanently…", t.danger)
-                                .on_click(cx.listener(move |this, _, window, cx| this.remove(n, true, window, cx))),
-                        )
+                        d.child(item("m-delete", "x", delete_label, t.danger).on_click(cx.listener(move |this, _, window, cx| {
+                            let nodes = this.chosen();
+                            this.remove(nodes, true, window, cx);
+                        })))
                     })
             });
         Some(deferred(anchored().position(m.at).snap_to_window().child(menu)).with_priority(1).into_any_element())
@@ -1397,13 +1601,17 @@ impl Diskie {
         let t = self.theme;
         let d = self.deleting.as_ref()?;
         let removed = d.progress.removed.load(Relaxed).min(d.total);
-        let (text, frac) = if d.permanent {
+        // Several items moved to the Bin are counted one by one; a single one isn't.
+        let counted = d.permanent || d.items > 1;
+        let (text, frac) = if counted {
             let text = format!(
-                "Deleting {} · {} of {} items · {} freed",
+                "{} {} · {} of {} items · {} {}",
+                if d.permanent { "Deleting" } else { "Moving" },
                 d.name,
                 fmt::count(removed),
                 fmt::count(d.total),
-                fmt::size(d.progress.bytes.load(Relaxed))
+                fmt::size(d.progress.bytes.load(Relaxed)),
+                if d.permanent { "freed" } else { "moved" }
             );
             (text, Some(removed as f32 / d.total.max(1) as f32))
         } else {
@@ -1436,7 +1644,7 @@ impl Diskie {
                 .when_some(frac, |row, f| {
                     row.child(div().flex_none().w(px(34.)).text_right().font_family(words::MONO_FONT).child(format!("{:.0}%", f * 100.0)))
                 })
-                .when(d.permanent, |row| {
+                .when(counted, |row| {
                     row.child(
                         div()
                             .id("stop-delete")
@@ -1464,6 +1672,7 @@ impl Diskie {
 
     fn status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = self.theme;
+        let live = self.live_indicator(cx);
         let left = if let Some(l) = &self.loaded {
             let tr = &l.tree;
             let mut s = format!(
@@ -1479,6 +1688,10 @@ impl Diskie {
             );
             if tr.unreadable > 0 {
                 s.push_str(&format!(" · {} folders unreadable", fmt::count(tr.unreadable as u64)));
+            }
+            let online = tr.online_total(Tree::ROOT);
+            if online > 0 {
+                s.push_str(&format!(" · {} more online only", fmt::size(online)));
             }
             s
         } else {
@@ -1517,6 +1730,7 @@ impl Diskie {
             .border_t_1()
             .border_color(rgb(t.chrome_line))
             .child(div().flex_1().min_w_0().truncate().child(left))
+            .children(live)
             .when_some(free, |d, f| d.child(div().flex_none().child(f)))
             .child(
                 div()
@@ -1592,7 +1806,7 @@ impl Render for Diskie {
                 .size_full()
                 .flex()
                 .flex_col()
-                .child(div().flex_1().min_h_0().flex().child(self.table(cx)).child(self.types_panel()))
+                .child(div().flex_1().min_h_0().flex().child(self.results(cx)).child(self.legend_panel(cx)))
                 .child(
                     div()
                         .id("split")
@@ -1700,13 +1914,13 @@ fn num(s: String, w: f32) -> Div {
     div().w(px(w)).flex_none().flex().justify_end().child(s)
 }
 
-/// Whether `n` can be deleted: not the scanned folder itself, not a synthetic entry, and not a
-/// mount point, whose contents belong to another file system the scan never entered.
 /// "deleting X", or "moving X to the Recycle Bin", for asking to wait.
 fn busy_text(d: &Deleting) -> String {
     if d.permanent { format!("deleting {}", d.name) } else { format!("moving {} to the {}", d.name, words::BIN) }
 }
 
+/// Whether `n` can be deleted: not the scanned folder itself, not a synthetic entry, and not a
+/// mount point, whose contents belong to another file system the scan never entered.
 fn removable(tree: &Tree, n: u32) -> bool {
     n != Tree::ROOT && !tree.has(n, flag::SYNTHETIC) && !tree.has(n, flag::MOUNT)
 }

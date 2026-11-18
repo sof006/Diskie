@@ -150,6 +150,14 @@ pub struct Palette {
 /// Rasterizes the rectangles into a `w` x `h` RGBA (or BGRA) buffer at `scale` device pixels
 /// per layout pixel. Leaves get a 1-pixel gap where they are big enough to keep one.
 pub fn rasterize(tree: &Tree, rects: &[MapRect], pal: &Palette, w: u32, h: u32, scale: f32, bgra: bool) -> Vec<u8> {
+    rasterize_with(tree, rects, pal, &|n| pal.kinds[tree.kind[n as usize] as usize % KIND_COUNT], w, h, scale, bgra)
+}
+
+/// [`rasterize`] with each leaf's colour chosen by `leaf` (by age, by change, ...) instead of
+/// by file type.
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_with(tree: &Tree, rects: &[MapRect], pal: &Palette, leaf: &dyn Fn(u32) -> u32, w: u32, h: u32, scale: f32, bgra: bool) -> Vec<u8> {
+    let _ = tree;
     let px = |c: u32| -> [u8; 4] {
         let (r, g, b) = (((c >> 16) & 0xff) as u8, ((c >> 8) & 0xff) as u8, (c & 0xff) as u8);
         if bgra { [b, g, r, 255] } else { [r, g, b, 255] }
@@ -171,7 +179,7 @@ pub fn rasterize(tree: &Tree, rects: &[MapRect], pal: &Palette, w: u32, h: u32, 
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        let color = if r.group { pal.groups[r.depth as usize % 3] } else { pal.kinds[tree.kind[r.node as usize] as usize % KIND_COUNT] };
+        let color = if r.group { pal.groups[r.depth as usize % 3] } else { leaf(r.node) };
         let c = px(color);
         for y in y0..y1 {
             let start = (y as usize * w as usize + x0 as usize) * 4;

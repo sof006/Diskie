@@ -46,16 +46,27 @@ pub fn scan(letter: char, progress: &Progress) -> Result<Tree, String> {
         let name = name.to_string();
         let info = file.standard_information();
         let mtime = info.as_ref().map(|s| s.modified().unix_timestamp().clamp(0, u32::MAX as i64) as u32).unwrap_or(0);
-        let reparse = info.as_ref().is_some_and(|s| s.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+        let attrs = info.as_ref().map(|s| s.file_attributes()).unwrap_or(0);
+        let reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
         if file.is_directory() {
+            // Junctions and directory links have no children here (theirs belong to the
+            // target), but OneDrive folders are reparse points too: sorted out after the build.
             let f = flag::DIR | if reparse { flag::REPARSE } else { 0 };
             chunk.push(file.number(), parent, &name, 0, mtime, f);
             dirs += 1;
         } else {
-            let size = if reparse { 0 } else { file.data_streams().find(|s| s.name.is_none()).map(|s| s.size).unwrap_or(0) };
-            chunk.push(NO_KEY, parent, &name, size, mtime, if reparse { flag::REPARSE } else { 0 });
+            let size = file.data_streams().find(|s| s.name.is_none()).map(|s| s.size).unwrap_or(0);
+            // A symbolic link has no data of its own. Other reparse points with data are cloud
+            // or deduplicated files, which are real files.
+            let f = match crate::cloud_flag(attrs) {
+                0 if reparse && size == 0 => flag::REPARSE,
+                f => f,
+            };
+            chunk.push(NO_KEY, parent, &name, size, mtime, f);
             files += 1;
-            bytes += size;
+            if f & flag::CLOUD == 0 {
+                bytes += size;
+            }
         }
     }
     for (number, name) in METADATA {
@@ -71,5 +82,12 @@ pub fn scan(letter: char, progress: &Progress) -> Result<Tree, String> {
     drop(mft);
 
     progress.set_phase(Phase::Building);
-    Ok(Tree::build(&format!("{letter}:\\"), ROOT_RECORD, vec![chunk], records.max(ROOT_RECORD + 1)))
+    let mut tree = Tree::build(&format!("{letter}:\\"), ROOT_RECORD, vec![chunk], records.max(ROOT_RECORD + 1));
+    // A reparse folder with children of its own is a cloud folder (OneDrive), not a link.
+    for n in 0..tree.len() as u32 {
+        if tree.has(n, flag::DIR) && tree.has(n, flag::REPARSE) && !tree.kids(n).is_empty() {
+            tree.flags[n as usize] = (tree.flags[n as usize] & !flag::REPARSE) | flag::SYNCED;
+        }
+    }
+    Ok(tree)
 }

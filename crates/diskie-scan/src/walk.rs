@@ -190,19 +190,34 @@ fn list(q: &Queue, job: &Job, chunk: &mut Chunk, found: &mut Vec<Job>, next_key:
             dirs += 1;
         } else if ft.is_dir() {
             let key = next_key.fetch_add(1, Relaxed);
-            chunk.push(key, job.key, &name, 0, mtime, flag::DIR);
+            chunk.push(key, job.key, &name, 0, mtime, flag::DIR | (attributes(meta.as_ref()) & flag::SYNCED));
             found.push(Job { path: entry.path(), key });
             dirs += 1;
         } else {
             let size = if counted_before(q, meta.as_ref()) { 0 } else { meta.as_ref().map(|m| m.len()).unwrap_or(0) };
-            chunk.push(NO_KEY, job.key, &name, size, mtime, 0);
+            let f = attributes(meta.as_ref());
+            chunk.push(NO_KEY, job.key, &name, size, mtime, f);
             files += 1;
-            bytes += size;
+            if f & flag::CLOUD == 0 {
+                bytes += size;
+            }
         }
     }
     progress.files.fetch_add(files, Relaxed);
     progress.dirs.fetch_add(dirs, Relaxed);
     progress.bytes.fetch_add(bytes, Relaxed);
+}
+
+/// [`flag::CLOUD`] or [`flag::SYNCED`] from a Windows entry's attributes. Links never get here.
+#[cfg(windows)]
+fn attributes(meta: Option<&std::fs::Metadata>) -> u8 {
+    use std::os::windows::fs::MetadataExt;
+    meta.map(|m| crate::cloud_flag(m.file_attributes())).unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn attributes(_: Option<&std::fs::Metadata>) -> u8 {
+    0
 }
 
 #[cfg(unix)]
