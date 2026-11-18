@@ -3,7 +3,7 @@
 A disk space analyzer written entirely in Rust, aimed at the same space as TreeSize and WizTree.
 The goals are WizTree-class scan speed, TreeSize-class features (SMB shares, reports, snapshots, owners, duplicates), a small footprint, and an interface that looks like a well-made tool, not a template.
 
-> Status: **0.2.0 preview released** (2026-11-18): scanning (MFT and parallel walk), the linked tree and treemap, file types, Recycle Bin, themes and the signed self-updater. Windows is the main platform. **Linux (phase 7) shipped in 0.2.0**: mounts and free space, a one-file-system walk that counts hard links once, a self-drawn window frame where the desktop has none, Trash, and the tar.gz and AppImage with self-update, tested under WSLg (Wayland). Still open for Linux: testing on X11 and real Ubuntu, Fedora and Arch desktops, and the built-in SMB client. Open source. Decisions are recorded in §8.
+> Status: **0.2.1 preview released** (2026-11-18): scanning (MFT and parallel walk), the linked tree and treemap, file types, Recycle Bin, themes and the signed self-updater. Windows is the main platform. **Linux (phase 7) shipped in 0.2.0**: mounts and free space, a one-file-system walk that counts hard links once, a self-drawn window frame where the desktop has none, Trash, and the tar.gz and AppImage with self-update, tested under WSLg (Wayland). Still open for Linux: testing on X11 and real Ubuntu, Fedora and Arch desktops, and the built-in SMB client. Open source. Decisions are recorded in §8.
 
 ---
 

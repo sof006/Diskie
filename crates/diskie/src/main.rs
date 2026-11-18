@@ -6,6 +6,7 @@
 
 mod app;
 mod crash;
+mod files;
 mod frame;
 mod elevate;
 mod icons;

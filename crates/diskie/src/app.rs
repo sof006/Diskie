@@ -138,6 +138,16 @@ enum UpdateState {
 struct Menu {
     at: Point<Pixels>,
     node: u32,
+    /// Opened with Shift held: also offers deleting permanently.
+    extended: bool,
+    /// The item's location has a Recycle Bin (Trash).
+    bin: bool,
+}
+
+impl Menu {
+    fn new(at: Point<Pixels>, node: u32, extended: bool, tree: &Tree) -> Self {
+        Menu { at, node, extended, bin: volumes::has_recycle_bin(Path::new(&tree.path(node))) }
+    }
 }
 
 pub struct Diskie {
@@ -391,7 +401,7 @@ impl Diskie {
             }
             "enter" => self.zoom_to(sel, cx),
             "backspace" => self.zoom_out(cx),
-            "delete" => self.recycle(sel, window, cx),
+            "delete" => self.remove(sel, k.modifiers.shift, window, cx),
             "c" if ctrl => self.copy_path(sel, cx),
             _ => {}
         }
@@ -409,25 +419,37 @@ impl Diskie {
     }
 
     fn reveal_in_explorer(&mut self, n: u32, cx: &mut Context<Self>) {
-        if let Some(l) = &self.loaded {
-            cx.reveal_path(Path::new(&l.tree.path(n)));
-        }
+        let Some(l) = &self.loaded else { return };
+        let path = PathBuf::from(l.tree.path(n));
+        let job = cx.background_spawn(async move { crate::files::reveal(&path) });
+        let task = cx.spawn(async move |this, cx| {
+            if let Err(e) = job.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.notice = Some((format!("Couldn't open the file manager: {e}"), true));
+                    cx.notify();
+                });
+            }
+        });
+        self._tasks.push(task);
     }
 
-    fn recycle(&mut self, n: u32, window: &mut Window, cx: &mut Context<Self>) {
+    /// Moves to the Recycle Bin (Trash), or with `permanent` deletes for good. Both ask first.
+    fn remove(&mut self, n: u32, permanent: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(l) = &self.loaded else { return };
-        if n == Tree::ROOT || l.tree.has(n, flag::SYNTHETIC) {
+        if !removable(&l.tree, n) {
             return;
         }
         let path = l.tree.path(n);
-        if !volumes::has_recycle_bin(Path::new(&path)) {
+        if !permanent && !volumes::has_recycle_bin(Path::new(&path)) {
             self.notice = Some((words::NO_BIN.into(), true));
             cx.notify();
             return;
         }
         let name = l.tree.name(n).to_string();
         let mut detail = if l.tree.is_dir(n) {
-            format!("{}, {} files in {} folders.\n{path}", fmt::size(l.tree.size[n as usize]), fmt::count(l.tree.files[n as usize] as u64), fmt::count(l.tree.dirs[n as usize] as u64))
+            let (files, dirs) = (l.tree.files[n as usize] as u64, l.tree.dirs[n as usize] as u64);
+            let many = |n: u64, one: &str, more: &str| format!("{} {}", fmt::count(n), if n == 1 { one } else { more });
+            format!("{}, {} in {}.\n{path}", fmt::size(l.tree.size[n as usize]), many(files, "file", "files"), many(dirs, "folder", "folders"))
         } else {
             format!("{}.\n{path}", fmt::size(l.tree.size[n as usize]))
         };
@@ -436,15 +458,32 @@ impl Diskie {
             detail.push_str(words::SYSTEM_WARNING);
         }
         let bin = words::BIN;
-        let confirm = format!("Move to {bin}");
-        let answer = window.prompt(PromptLevel::Warning, &format!("Move “{name}” to the {bin}?"), Some(&detail), &[confirm.as_str(), "Cancel"], cx);
+        let (level, title, confirm) = if permanent {
+            detail.push_str(&format!("\n\nThis can't be undone: it is deleted for good, not moved to the {bin}."));
+            (PromptLevel::Critical, format!("Permanently delete “{name}”?"), "Delete permanently".to_string())
+        } else {
+            (PromptLevel::Warning, format!("Move “{name}” to the {bin}?"), format!("Move to {bin}"))
+        };
+        let answer = window.prompt(level, &title, Some(&detail), &[confirm.as_str(), "Cancel"], cx);
         self.menu = None;
         let task = cx.spawn(async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
             }
+            let _ = this.update(cx, |this, cx| {
+                this.notice = Some((format!("Deleting {name}…"), false));
+                cx.notify();
+            });
             let p2 = path.clone();
-            let result = cx.background_spawn(async move { trash::delete(&p2) }).await;
+            let result = cx
+                .background_spawn(async move {
+                    if permanent {
+                        crate::files::delete_permanently(Path::new(&p2)).map_err(|e| e.to_string())
+                    } else {
+                        trash::delete(&p2).map_err(|e| e.to_string())
+                    }
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
@@ -460,8 +499,19 @@ impl Diskie {
                             l.selected = Some(parent);
                             l.rebuild_rows();
                             l.space = volumes::space(&l.root);
-                            this.notice = Some((format!("Moved {name} to the {} ({})", words::BIN, fmt::size(freed)), false));
+                            this.notice = Some((
+                                if permanent {
+                                    format!("Deleted {name} permanently ({})", fmt::size(freed))
+                                } else {
+                                    format!("Moved {name} to the {} ({})", words::BIN, fmt::size(freed))
+                                },
+                                false,
+                            ));
                         }
+                    }
+                    // A folder may be partly deleted by now, so the tree no longer says what's left.
+                    Err(e) if permanent => {
+                        this.notice = Some((format!("Couldn't delete all of {name}: {e}. Rescan (F5) to see what is left."), true))
                     }
                     Err(e) => this.notice = Some((format!("Could not move {name} to the {}: {e}", words::BIN), true)),
                 }
@@ -939,7 +989,7 @@ impl Diskie {
                     }))
                     .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                         this.select(n, false, cx);
-                        this.menu = Some(Menu { at: ev.position, node: n });
+                        this.menu = this.loaded.as_ref().map(|l| Menu::new(ev.position, n, ev.modifiers.shift, &l.tree));
                         cx.notify();
                     }))
             })
@@ -1118,7 +1168,7 @@ impl Diskie {
                     .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                         let Some(n) = this.loaded.as_ref().and_then(|l| this.map.borrow().hit(ev.position, l.scan)) else { return };
                         this.select(n, true, cx);
-                        this.menu = Some(Menu { at: ev.position, node: n });
+                        this.menu = this.loaded.as_ref().map(|l| Menu::new(ev.position, n, ev.modifiers.shift, &l.tree));
                         cx.notify();
                     }))
                     .child(treemap_view::element(self.map.clone(), paint)),
@@ -1132,7 +1182,8 @@ impl Diskie {
         let l = self.loaded.as_ref()?;
         let n = m.node;
         let is_dir = l.tree.is_dir(n);
-        let deletable = n != Tree::ROOT && !l.tree.has(n, flag::SYNTHETIC);
+        let deletable = removable(&l.tree, n);
+        let (offer_bin, offer_permanent) = (m.bin, m.extended || !m.bin);
         let item = |id: &'static str, icon: &'static str, label: &'static str, color: u32| {
             div()
                 .id(id)
@@ -1179,10 +1230,19 @@ impl Diskie {
                 this.copy_path(n, cx);
             })))
             .when(deletable, |d| {
-                d.child(div().my_1().h(px(1.)).bg(rgb(t.line))).child(
-                    item("m-trash", "trash", words::MOVE_TO_BIN, t.danger)
-                        .on_click(cx.listener(move |this, _, window, cx| this.recycle(n, window, cx))),
-                )
+                d.child(div().my_1().h(px(1.)).bg(rgb(t.line)))
+                    .when(offer_bin, |d| {
+                        d.child(
+                            item("m-trash", "trash", words::MOVE_TO_BIN, t.danger)
+                                .on_click(cx.listener(move |this, _, window, cx| this.remove(n, false, window, cx))),
+                        )
+                    })
+                    .when(offer_permanent, |d| {
+                        d.child(
+                            item("m-delete", "x", "Delete permanently…", t.danger)
+                                .on_click(cx.listener(move |this, _, window, cx| this.remove(n, true, window, cx))),
+                        )
+                    })
             });
         Some(deferred(anchored().position(m.at).snap_to_window().child(menu)).with_priority(1).into_any_element())
     }
@@ -1503,6 +1563,12 @@ fn is_dark(window: &Window) -> bool {
 
 fn num(s: String, w: f32) -> Div {
     div().w(px(w)).flex_none().flex().justify_end().child(s)
+}
+
+/// Whether `n` can be deleted: not the scanned folder itself, not a synthetic entry, and not a
+/// mount point, whose contents belong to another file system the scan never entered.
+fn removable(tree: &Tree, n: u32) -> bool {
+    n != Tree::ROOT && !tree.has(n, flag::SYNTHETIC) && !tree.has(n, flag::MOUNT)
 }
 
 fn tag(s: &'static str, t: Theme) -> Div {

@@ -5,9 +5,9 @@ mod imp {
     pub const BIN: &str = "Recycle Bin";
     pub const SHOW_IN_FILES: &str = "Show in Explorer";
     pub const MOVE_TO_BIN: &str = "Move to Recycle Bin…";
-    pub const KEYS_HINT: &str = "Arrows move, Enter zooms in, Backspace goes up, Del moves to the Recycle Bin.";
+    pub const KEYS_HINT: &str = "Arrows move, Enter zooms in, Backspace goes up, Del moves to the Recycle Bin, Shift+Del deletes permanently.";
     pub const NO_BIN: &str =
-        "This location has no Recycle Bin (network share or removable drive), so Diskie won't delete here. Use Explorer if you mean to delete it permanently.";
+        "This location has no Recycle Bin (network share or removable drive). To delete it permanently, press Shift+Del or right-click it.";
     pub const SYSTEM_WARNING: &str = "This is inside a Windows system folder. Removing it can stop Windows or installed programs from working.";
     pub const NETWORK_HINT: &str = r"Type a \\server\share path into the folder box to scan a network share.";
     pub const UI_FONT: &str = "Segoe UI";
@@ -34,9 +34,9 @@ mod imp {
     pub const BIN: &str = "Trash";
     pub const SHOW_IN_FILES: &str = "Show in file manager";
     pub const MOVE_TO_BIN: &str = "Move to Trash…";
-    pub const KEYS_HINT: &str = "Arrows move, Enter zooms in, Backspace goes up, Del moves to the Trash.";
+    pub const KEYS_HINT: &str = "Arrows move, Enter zooms in, Backspace goes up, Del moves to the Trash, Shift+Del deletes permanently.";
     pub const NO_BIN: &str =
-        "This location has no Trash (it is a network share), so Diskie won't delete here. Use your file manager if you mean to delete it permanently.";
+        "This location has no Trash (it is a network share). To delete it permanently, press Shift+Del or right-click it.";
     pub const SYSTEM_WARNING: &str = "This is inside a system folder. Removing it can stop Linux or installed programs from working.";
     pub const NETWORK_HINT: &str = "Network shares appear under Drives once mounted, for example by opening them in your file manager.";
     /// The desktop's own interface font.
